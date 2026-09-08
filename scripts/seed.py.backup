@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+"""
+Database Seed Script
+
+Creates initial data for development:
+- Default admin user
+- Sample products
+- Legal rules (prototype)
+
+IMPORTANT SECURITY WARNING:
+The default admin password (admin123) is for DEVELOPMENT ONLY.
+Change it immediately in production.
+"""
+import os
+import sys
+
+# Add project root to path
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.config import settings
+from app.database import Base, get_db
+from app.models import User, Product, Rule, Inspection
+from app.utils.helpers import generate_password_hash
+
+
+def create_tables(engine):
+    """Create all database tables."""
+    print("Creating database tables...")
+    Base.metadata.create_all(bind=engine)
+    print("✓ Tables created successfully")
+
+
+def create_admin_user(db_session):
+    """Create default admin user."""
+    print("\nCreating default admin user...")
+
+    # Check if admin already exists
+    existing = db_session.query(User).filter(User.email == "admin@example.com").first()
+    if existing:
+        print(f"⚠ Admin user already exists: {existing.email}")
+        return existing
+
+    # Create admin user
+    admin = User(
+        email="admin@example.com",
+        username="admin",
+        hashed_password=generate_password_hash("admin123"),
+        full_name="System Administrator",
+        role="ADMIN",
+        is_active=True,
+        is_verified=True,
+    )
+
+    db_session.add(admin)
+    db_session.commit()
+    db_session.refresh(admin)
+
+    print(f"✓ Admin user created: admin@example.com / admin123")
+    print("  ⚠️  CHANGE THIS PASSWORD IN PRODUCTION!")
+
+    return admin
+
+
+def create_sample_products(db_session):
+    """Create sample products for testing."""
+    print("\nCreating sample products...")
+
+    products_data = [
+        {
+            "product_name": "Aashirvaad Whole Wheat Atta",
+            "brand": "Aashirvaad",
+            "category": "Food/Grains",
+            "manufacturer": "ITC Limited",
+            "barcode": "8901234567890",
+        },
+        {
+            "product_name": "Parle-G Glucose Biscuit",
+            "brand": "Parle",
+            "category": "Food/Biscuits",
+            "manufacturer": "Parle Products Pvt Ltd",
+            "barcode": "8901234567891",
+        },
+        {
+            "product_name": "Dove Beauty Bar",
+            "brand": "Dove",
+            "category": "Personal Care/Soap",
+            "manufacturer": "Unilever",
+            "barcode": "8901234567892",
+        },
+        {
+            "product_name": "Tata Salt",
+            "brand": "Tata",
+            "category": "Food/Spices",
+            "manufacturer": "Tata Chemicals Ltd",
+            "barcode": "8901234567893",
+        },
+        {
+            "product_name": "Colgate Toothpaste",
+            "brand": "Colgate",
+            "category": "Personal Care/Dental",
+            "manufacturer": "Colgate-Palmolive",
+            "barcode": "8901234567894",
+        },
+    ]
+
+    created = 0
+    for prod_data in products_data:
+        existing = db_session.query(Product).filter(
+            Product.barcode == prod_data["barcode"]
+        ).first()
+
+        if not existing:
+            product = Product(**prod_data)
+            db_session.add(product)
+            created += 1
+
+    db_session.commit()
+    print(f"✓ Created {created} sample products")
+
+
+def create_legal_rules(db_session):
+    """Create prototype legal rules."""
+    print("\nCreating prototype legal rules...")
+
+    rules_data = [
+        {
+            "rule_code": "LM-MRP-001",
+            "rule_name": "MRP Declaration Required",
+            "description": "Every packaged commodity must display Maximum Retail Price (MRP)",
+            "field_name": "mrp",
+            "required": True,
+            "validation_type": "required",
+            "severity": "CRITICAL",
+            "legal_reference": "Legal Metrology (Packaged Commodities) Rules, 2011 - Rule 6(1)",
+            "applicable_category": None,
+            "active": True,
+            "ruleset_version": "1.0.0",
+        },
+        {
+            "rule_code": "LM-MRP-002",
+            "rule_name": "MRP Format Validation",
+            "description": "MRP must be in numerical format with proper currency symbol",
+            "field_name": "mrp",
+            "required": True,
+            "validation_type": "format",
+            "severity": "HIGH",
+            "legal_reference": "Legal Metrology Rules 2011 - Rule 6(2)",
+            "applicable_category": None,
+            "active": True,
+            "ruleset_version": "1.0.0",
+        },
+        {
+            "rule_code": "LM-NQ-001",
+            "rule_name": "Net Quantity Declaration Required",
+            "description": "Every package must declare net quantity in standard units (g, kg, ml, L)",
+            "field_name": "net_quantity",
+            "required": True,
+            "validation_type": "required",
+            "severity": "CRITICAL",
+            "legal_reference": "Legal Metrology (Packaged Commodities) Rules, 2011 - Rule 6(3)",
+            "applicable_category": None,
+            "active": True,
+            "ruleset_version": "1.0.0",
+        },
+        {
+            "rule_code": "LM-NQ-002",
+            "rule_name": "Net Quantity Numeric Value",
+            "description": "Net quantity must have valid numeric value greater than zero",
+            "field_name": "net_quantity_value",
+            "required": True,
+            "validation_type": "range",
+            "severity": "HIGH",
+            "legal_reference": "Legal Metrology Rules 2011 - Rule 6(3)",
+            "applicable_category": None,
+            "active": True,
+            "ruleset_version": "1.0.0",
+        },
+        {
+            "rule_code": "LM-MFG-001",
+            "rule_name": "Manufacturer/Packer Declaration",
+            "description": "Name and address of manufacturer or packer must be declared",
+            "field_name": "manufacturer",
+            "required": True,
+            "validation_type": "required",
+            "severity": "HIGH",
+            "legal_reference": "Legal Metrology (Packaged Commodities) Rules, 2011 - Rule 6(4)",
+            "applicable_category": None,
+            "active": True,
+            "ruleset_version": "1.0.0",
+        },
+        {
+            "rule_code": "LM-MFG-002",
+            "rule_name": "Manufacturing Address",
+            "description": "Full address of manufacturing premise must be provided",
+            "field_name": "manufacturer_address",
+            "required": True,
+            "validation_type": "required",
+            "severity": "MEDIUM",
+            "legal_reference": "Legal Metrology Rules 2011 - Rule 6(4)",
+            "applicable_category": None,
+            "active": True,
+            "ruleset_version": "1.0.0",
+        },
+        {
+            "rule_code": "LM-DATE-001",
+            "rule_name": "Month/Year of Manufacture",
+            "description": "Month and year of manufacture must be declared on package",
+            "field_name": "manufacturing_date",
+            "required": True,
+            "validation_type": "required",
+            "severity": "HIGH",
+            "legal_reference": "Legal Metrology (Packaged Commodities) Rules, 2011 - Rule 6(5)",
+            "applicable_category": None,
+            "active": True,
+            "ruleset_version": "1.0.0",
+        },
+        {
+            "rule_code": "LM-DATE-002",
+            "rule_name": "Date Format Validation",
+            "description": "Date must be in recognizable format (e.g., Jan 2024, 01/2024)",
+            "field_name": "manufacturing_date",
+            "required": True,
+            "validation_type": "format",
+            "severity": "MEDIUM",
+            "legal_reference": "Legal Metrology Rules 2011 - Rule 6(5)",
+            "applicable_category": None,
+            "active": True,
+            "ruleset_version": "1.0.0",
+        },
+        {
+            "rule_code": "LM-CC-001",
+            "rule_name": "Consumer Care Contact Required",
+            "description": "Consumer care phone number or email must be provided for customer complaints",
+            "field_name": "consumer_care",
+            "required": True,
+            "validation_type": "required",
+            "severity": "HIGH",
+            "legal_reference": "Legal Metrology (Packaged Commodities) Rules, 2011 - Rule 6(6)",
+            "applicable_category": None,
+            "active": True,
+            "ruleset_version": "1.0.0",
+        },
+        {
+            "rule_code": "LM-CC-002",
+            "rule_name": "Consumer Care Phone Number",
+            "description": "At least one valid consumer care phone number must be declared",
+            "field_name": "consumer_care_phone",
+            "required": False,
+            "validation_type": "format",
+            "severity": "MEDIUM",
+            "legal_reference": "Legal Metrology Rules 2011 - Rule 6(6)",
+            "applicable_category": None,
+            "active": True,
+            "ruleset_version": "1.0.0",
+        },
+        {
+            "rule_code": "LM-CC-003",
+            "rule_name": "Consumer Care Email",
+            "description": "At least one valid consumer care email address should be provided",
+            "field_name": "consumer_care_email",
+            "required": False,
+            "validation_type": "format",
+            "severity": "LOW",
+            "legal_reference": "Legal Metrology Rules 2011 - Rule 6(6)",
+            "applicable_category": None,
+            "active": True,
+            "ruleset_version": "1.0.0",
+        },
+        {
+            "rule_code": "LM-COO-001",
+            "rule_name": "Country of Origin Declaration",
+            "description": "Country of origin must be declared for imported products",
+            "field_name": "country_of_origin",
+            "required": True,
+            "validation_type": "required",
+            "severity": "HIGH",
+            "legal_reference": "Legal Metrology (Packaged Commodities) Rules, 2011 - Rule 6(7)",
+            "applicable_category": "Imported",
+            "active": True,
+            "ruleset_version": "1.0.0",
+        },
+        {
+            "rule_code": "LM-PNM-001",
+            "rule_name": "Product Name Declaration",
+            "description": "Product name must be clearly declared on principal display panel",
+            "field_name": "product_name",
+            "required": True,
+            "validation_type": "required",
+            "severity": "MEDIUM",
+            "legal_reference": "Legal Metrology Rules 2011 - Rule 6(8)",
+            "applicable_category": None,
+            "active": True,
+            "ruleset_version": "1.0.0",
+        },
+        {
+            "rule_code": "LM-LIC-001",
+            "rule_name": "License Number Declaration",
+            "description": "Manufacturer license number or FSSAI license should be declared",
+            "field_name": "manufacturing_license",
+            "required": False,
+            "validation_type": "exists",
+            "severity": "MEDIUM",
+            "legal_reference": "Legal Metrology Rules 2011 / FSSAI Regulations",
+            "applicable_category": "Food",
+            "active": True,
+            "ruleset_version": "1.0.0",
+        },
+    ]
+
+    created = 0
+    for rule_data in rules_data:
+        existing = db_session.query(Rule).filter(
+            Rule.rule_code == rule_data["rule_code"]
+        ).first()
+
+        if not existing:
+            rule = Rule(**rule_data)
+            db_session.add(rule)
+            created += 1
+
+    db_session.commit()
+    print(f"✓ Created {created} prototype legal rules")
+    print("  ⚠️  These are PROTOTYPE rules - legal team should verify references")
+
+
+def create_sample_inspection(db_session, admin_user):
+    """Create a sample inspection for testing."""
+    print("\nCreating sample inspection...")
+
+    # Get a product
+    product = db_session.query(Product).first()
+    if not product:
+        print("⚠ No products found - skipping inspection creation")
+        return
+
+    # Create inspection
+    from datetime import datetime
+    inspection = Inspection(
+        product_id=product.id,
+        inspector_id=admin_user.id,
+        status="PROCESSING",
+        notes="Sample inspection created by seed script",
+        ruleset_version="1.0.0",
+    )
+
+    db_session.add(inspection)
+    db_session.commit()
+    db_session.refresh(inspection)
+
+    print(f"✓ Created sample inspection #{inspection.id}")
+
+
+def seed_database():
+    """Main seed function."""
+    print("\n" + "="*60)
+    print("  LEGAL METROLOGY COMPLIANCE SYSTEM - Database Seed")
+    print("="*60)
+
+    # Create database session
+    engine = create_engine(
+        settings.DATABASE_URL,
+        connect_args={"check_same_thread": False} if "sqlite" in settings.DATABASE_URL else {},
+    )
+    SessionLocal = sessionmaker(bind=engine)
+
+    try:
+        db = SessionLocal()
+
+        # Create tables
+        create_tables(engine)
+
+        # Seed data
+        admin = create_admin_user(db)
+        create_sample_products(db)
+        create_legal_rules(db)
+        create_sample_inspection(db, admin)
+
+        print("\n" + "="*60)
+        print("  Seeding completed successfully!")
+        print("="*60)
+        print("\nDevelopment credentials:")
+        print("  Email: admin@example.com")
+        print("  Password: admin123")
+        print("\n⚠  WARNING: Change password in production!")
+        print("="*60 + "\n")
+
+    except Exception as e:
+        print(f"\n✗ Error during seeding: {e}")
+        raise
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    seed_database()
