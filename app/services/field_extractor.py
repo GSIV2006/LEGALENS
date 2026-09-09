@@ -2,19 +2,14 @@
 LEGALENS Field Extraction Service
 
 Converts OCR detections into structured packaged-commodity fields.
-
-Design goals:
-- Work with arbitrary packaged-product label layouts.
-- Preserve OCR evidence and bounding boxes.
-- Extract fields only when there is sufficient textual evidence.
-- Never invent values when the OCR does not support them.
 """
 
 import re
 from datetime import datetime
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 
 from app.schemas.ocr import OcrTextItem
+from app.services.verification_service import VerificationService
 
 
 class FieldExtractorService:
@@ -26,22 +21,15 @@ class FieldExtractorService:
             "gms": "g",
             "gram": "g",
             "grams": "g",
-
             "kg": "kg",
             "kgs": "kg",
             "kilogram": "kg",
             "kilograms": "kg",
-
-            "mg": "mg",
-            "milligram": "mg",
-            "milligrams": "mg",
-
             "ml": "ml",
             "milliliter": "ml",
             "milliliters": "ml",
             "millilitre": "ml",
             "millilitres": "ml",
-
             "l": "L",
             "lt": "L",
             "ltr": "L",
@@ -51,9 +39,7 @@ class FieldExtractorService:
             "litres": "L",
         }
 
-    # =============================================================
-    # Main extraction
-    # =============================================================
+        self.verifier = VerificationService()
 
     async def extract_fields(
         self,
@@ -64,17 +50,12 @@ class FieldExtractorService:
         items = [
             item
             for item in ocr_texts
-            if item.text and item.text.strip()
-        ]
-
-        lines = [
-            self._clean_text(item.text)
-            for item in items
+            if getattr(item, "text", None)
+            and str(item.text).strip()
         ]
 
         extracted = {
             "product_name": None,
-
             "mrp": None,
             "currency": "INR",
 
@@ -111,12 +92,15 @@ class FieldExtractorService:
             "manufacturing_license": None,
 
             "extracted_fields": {},
+            "verification": {},
             "confidence": 0.0,
-            "extraction_method": "ocr-aware-regex",
-            "extracted_at": datetime.utcnow().isoformat(),
+            "extraction_method":
+                "ocr-aware-regex+semantic-verification",
+            "extracted_at":
+                datetime.utcnow().isoformat(),
         }
 
-        confidences: List[float] = []
+        confidences = []
 
         # ---------------------------------------------------------
         # MRP
@@ -130,24 +114,44 @@ class FieldExtractorService:
                 "currency",
                 "INR",
             )
-            extracted["extracted_fields"]["mrp"] = mrp_result
-            confidences.append(mrp_result["confidence"])
+
+            extracted["extracted_fields"]["mrp"] = (
+                mrp_result
+            )
+
+            confidences.append(
+                mrp_result["confidence"]
+            )
 
         # ---------------------------------------------------------
-        # Net quantity
+        # NET QUANTITY
         # ---------------------------------------------------------
 
         qty_result = self._extract_net_quantity(items)
 
         if qty_result:
-            extracted["net_quantity"] = qty_result["display"]
-            extracted["net_quantity_value"] = qty_result["value"]
-            extracted["net_quantity_unit"] = qty_result["unit"]
-            extracted["extracted_fields"]["net_quantity"] = qty_result
-            confidences.append(qty_result["confidence"])
+            extracted["net_quantity"] = (
+                qty_result["display"]
+            )
+
+            extracted["net_quantity_value"] = (
+                qty_result["value"]
+            )
+
+            extracted["net_quantity_unit"] = (
+                qty_result["unit"]
+            )
+
+            extracted["extracted_fields"][
+                "net_quantity"
+            ] = qty_result
+
+            confidences.append(
+                qty_result["confidence"]
+            )
 
         # ---------------------------------------------------------
-        # Manufacturer
+        # MANUFACTURER
         # ---------------------------------------------------------
 
         manufacturer = self._extract_labeled_party(
@@ -160,13 +164,19 @@ class FieldExtractorService:
                 "manufactured for",
                 "made by",
                 "prepared by",
+                "mfd by",
+                "mfd.",
+                "mfd",
+                "mid by",
                 "mfg.",
                 "mfg",
             ],
         )
 
         if manufacturer:
-            extracted["manufacturer_name"] = manufacturer["name"]
+            extracted["manufacturer_name"] = (
+                manufacturer["name"]
+            )
 
             extracted["extracted_fields"][
                 "manufacturer"
@@ -176,8 +186,115 @@ class FieldExtractorService:
                 manufacturer["confidence"]
             )
 
+            # ---------------------------------------------------------
+            # MANUFACTURER ADDRESS
+            # ---------------------------------------------------------
+
+            manufacturer_address = None
+            manufacturer_index = None
+
+            for idx, item in enumerate(items):
+                item_text = self._item_text(item)
+
+                if not item_text:
+                    continue
+
+                normalized = re.sub(
+                    r"\s+",
+                    " ",
+                    item_text,
+                ).strip().lower()
+
+                if (
+                    "mfd by" in normalized
+                    or "mid by" in normalized
+                    or "manufactured by" in normalized
+                    or "manufactured and marketed by" in normalized
+                    or "manufactured & marketed by" in normalized
+                    or "mfd." in normalized
+                ):
+                    manufacturer_index = idx
+                    break
+
+            if manufacturer_index is not None:
+                for next_item in items[
+                    manufacturer_index + 1:
+                    manufacturer_index + 5
+                ]:
+                    candidate_raw = self._item_text(
+                        next_item
+                    )
+
+                    if not candidate_raw:
+                        continue
+
+                    candidate = re.sub(
+                        r"\s+",
+                        " ",
+                        candidate_raw,
+                    ).strip()
+
+                    lower_candidate = candidate.lower()
+
+                    if re.search(
+                        r"\b(?:mfg\.?\s+lic|licence|license)\b",
+                        lower_candidate,
+                        re.IGNORECASE,
+                    ):
+                        break
+
+                    looks_like_address = (
+                        bool(re.search(r"\d", candidate))
+                        and (
+                            "," in candidate
+                            or re.search(
+                                r"\b(?:road|rd|street|st|"
+                                r"nagar|estate|industrial|"
+                                r"phase|district|"
+                                r"puducherry|delhi|"
+                                r"mumbai|chennai|"
+                                r"bangalore|bengaluru|"
+                                r"india)\b",
+                                lower_candidate,
+                            )
+                        )
+                    )
+
+                    if looks_like_address:
+                        manufacturer_address = {
+                            "value": candidate,
+                            "confidence": float(
+                                getattr(
+                                    next_item,
+                                    "confidence",
+                                    None,
+                                )
+                                or 0.85
+                            ),
+                            "raw_text": candidate_raw,
+                            "bbox": getattr(
+                                next_item,
+                                "bbox",
+                                None,
+                            ),
+                        }
+                        break
+
+            if manufacturer_address:
+                extracted["manufacturer_address"] = (
+                    manufacturer_address["value"]
+                )
+
+                extracted["extracted_fields"][
+                    "manufacturer_address"
+                ] = manufacturer_address
+
+                confidences.append(
+                    manufacturer_address["confidence"]
+                )
+
         # ---------------------------------------------------------
-        # Packer
+        # PACKER
         # ---------------------------------------------------------
 
         packer = self._extract_labeled_party(
@@ -200,45 +317,8 @@ class FieldExtractorService:
                 packer["confidence"]
             )
 
-            # In packaged-goods inspection, a clear packer
-            # declaration is useful evidence for the
-            # manufacturer/packer requirement.
-            if not extracted["manufacturer_name"]:
-                extracted["manufacturer_name"] = packer["name"]
-
-                extracted["extracted_fields"][
-                    "manufacturer"
-                ] = {
-                    "name": packer["name"],
-                    "confidence": packer["confidence"],
-                    "raw_text": packer["raw_text"],
-                    "bbox": packer["bbox"],
-                    "source": "packer_declaration",
-                }
-
         # ---------------------------------------------------------
-        # Manufacturer / packer address
-        # ---------------------------------------------------------
-
-        address = self._extract_party_address(
-            items,
-            manufacturer,
-            packer,
-        )
-
-        if address:
-            extracted["manufacturer_address"] = address["value"]
-
-            extracted["extracted_fields"][
-                "manufacturer_address"
-            ] = address
-
-            confidences.append(
-                address["confidence"]
-            )
-
-        # ---------------------------------------------------------
-        # Importer
+        # IMPORTER
         # ---------------------------------------------------------
 
         importer = self._extract_labeled_party(
@@ -262,7 +342,7 @@ class FieldExtractorService:
             )
 
         # ---------------------------------------------------------
-        # Dates
+        # MANUFACTURING DATE
         # ---------------------------------------------------------
 
         manufacture = self._extract_date_field(
@@ -279,12 +359,16 @@ class FieldExtractorService:
         )
 
         if manufacture:
-            extracted["manufacturing_date"] = manufacture["date"]
-            extracted["manufacturing_month"] = manufacture.get(
-                "month"
+            extracted["manufacturing_date"] = (
+                manufacture["date"]
             )
-            extracted["manufacturing_year"] = manufacture.get(
-                "year"
+
+            extracted["manufacturing_month"] = (
+                manufacture.get("month")
+            )
+
+            extracted["manufacturing_year"] = (
+                manufacture.get("year")
             )
 
             extracted["extracted_fields"][
@@ -295,6 +379,10 @@ class FieldExtractorService:
                 manufacture["confidence"]
             )
 
+        # ---------------------------------------------------------
+        # PACKING DATE
+        # ---------------------------------------------------------
+
         packing = self._extract_date_field(
             items,
             [
@@ -302,14 +390,13 @@ class FieldExtractorService:
                 "date of pack",
                 "packing date",
                 "pack date",
-                "pkd on",
-                "packed on",
-                "date packed",
             ],
         )
 
         if packing:
-            extracted["packing_date"] = packing["date"]
+            extracted["packing_date"] = (
+                packing["date"]
+            )
 
             extracted["extracted_fields"][
                 "packing_date"
@@ -318,6 +405,10 @@ class FieldExtractorService:
             confidences.append(
                 packing["confidence"]
             )
+
+        # ---------------------------------------------------------
+        # USE BY
+        # ---------------------------------------------------------
 
         use_by = self._extract_date_field(
             items,
@@ -332,13 +423,17 @@ class FieldExtractorService:
                 "mfg date",
                 "date of packing",
                 "packing date",
-                "best before",
             ],
         )
 
         if use_by:
-            extracted["use_by"] = use_by["date"]
-            extracted["expiry_date"] = use_by["date"]
+            extracted["use_by"] = (
+                use_by["date"]
+            )
+
+            extracted["expiry_date"] = (
+                use_by["date"]
+            )
 
             extracted["extracted_fields"][
                 "use_by"
@@ -348,10 +443,16 @@ class FieldExtractorService:
                 use_by["confidence"]
             )
 
+        # ---------------------------------------------------------
+        # BEST BEFORE
+        # ---------------------------------------------------------
+
         best_before = self._extract_best_before(items)
 
         if best_before:
-            extracted["best_before"] = best_before["date"]
+            extracted["best_before"] = (
+                best_before["date"]
+            )
 
             extracted["extracted_fields"][
                 "best_before"
@@ -362,7 +463,7 @@ class FieldExtractorService:
             )
 
         # ---------------------------------------------------------
-        # Consumer care
+        # CONSUMER CARE
         # ---------------------------------------------------------
 
         consumer_care = self._extract_consumer_care(
@@ -370,17 +471,21 @@ class FieldExtractorService:
         )
 
         if consumer_care:
-            extracted["consumer_care_phone"] = (
-                consumer_care.get("phone")
-            )
 
-            extracted["consumer_care_email"] = (
-                consumer_care.get("email")
-            )
+            if consumer_care.get("phone"):
+                extracted["consumer_care_phone"] = (
+                    consumer_care["phone"]
+                )
 
-            extracted["consumer_care_address"] = (
-                consumer_care.get("address")
-            )
+            if consumer_care.get("email"):
+                extracted["consumer_care_email"] = (
+                    consumer_care["email"]
+                )
+
+            if consumer_care.get("address"):
+                extracted["consumer_care_address"] = (
+                    consumer_care["address"]
+                )
 
             extracted["extracted_fields"][
                 "consumer_care"
@@ -391,7 +496,7 @@ class FieldExtractorService:
             )
 
         # ---------------------------------------------------------
-        # Country of origin
+        # COUNTRY
         # ---------------------------------------------------------
 
         country = self._extract_country_of_origin(
@@ -399,7 +504,9 @@ class FieldExtractorService:
         )
 
         if country:
-            extracted["country_of_origin"] = country["value"]
+            extracted["country_of_origin"] = (
+                country["value"]
+            )
 
             extracted["extracted_fields"][
                 "country_of_origin"
@@ -410,7 +517,7 @@ class FieldExtractorService:
             )
 
         # ---------------------------------------------------------
-        # Unit sale price
+        # UNIT SALE PRICE
         # ---------------------------------------------------------
 
         unit_price = self._extract_unit_sale_price(
@@ -431,13 +538,15 @@ class FieldExtractorService:
             )
 
         # ---------------------------------------------------------
-        # Barcode
+        # BARCODE
         # ---------------------------------------------------------
 
         barcode = self._extract_barcode(items)
 
         if barcode:
-            extracted["barcode"] = barcode["value"]
+            extracted["barcode"] = (
+                barcode["value"]
+            )
 
             extracted["extracted_fields"][
                 "barcode"
@@ -454,7 +563,9 @@ class FieldExtractorService:
         fssai = self._extract_fssai(items)
 
         if fssai:
-            extracted["fssai_license"] = fssai["value"]
+            extracted["fssai_license"] = (
+                fssai["value"]
+            )
 
             extracted["extracted_fields"][
                 "fssai_license"
@@ -465,34 +576,37 @@ class FieldExtractorService:
             )
 
         # ---------------------------------------------------------
-        # Manufacturing license
+        # MANUFACTURING LICENSE
         # ---------------------------------------------------------
 
-        license_result = (
+        manufacturing_license = (
             self._extract_manufacturing_license(items)
         )
 
-        if license_result:
+        if manufacturing_license:
+
             extracted["manufacturing_license"] = (
-                license_result["value"]
+                manufacturing_license["value"]
             )
 
             extracted["extracted_fields"][
                 "manufacturing_license"
-            ] = license_result
+            ] = manufacturing_license
 
             confidences.append(
-                license_result["confidence"]
+                manufacturing_license["confidence"]
             )
 
         # ---------------------------------------------------------
-        # Product name
+        # PRODUCT NAME
         # ---------------------------------------------------------
 
         product = self._extract_product_name(items)
 
         if product:
-            extracted["product_name"] = product["value"]
+            extracted["product_name"] = (
+                product["value"]
+            )
 
             extracted["extracted_fields"][
                 "product_name"
@@ -502,117 +616,193 @@ class FieldExtractorService:
                 product["confidence"]
             )
 
-        # ---------------------------------------------------------
-        # Final confidence
-        # ---------------------------------------------------------
-
         if confidences:
             extracted["confidence"] = round(
                 sum(confidences) / len(confidences),
                 2,
             )
 
+        # ---------------------------------------------------------
+        # SEMANTIC VERIFICATION
+        # ---------------------------------------------------------
+
+        try:
+
+            verification = self.verifier.verify_all(
+                extracted["extracted_fields"],
+                items,
+            )
+
+            extracted["verification"] = verification
+
+            self._apply_verification(
+                extracted,
+                verification,
+            )
+
+        except Exception as exc:
+
+            extracted["verification"] = {
+                "_system": {
+                    "field": "_system",
+                    "verified": False,
+                    "decision": "REVIEW",
+                    "confidence": 0.0,
+                    "reason":
+                        f"Semantic verification error: {exc}",
+                    "evidence": [],
+                }
+            }
+
         return extracted
 
     # =============================================================
-    # General helpers
+    # APPLY VERIFICATION
+    # =============================================================
+
+    def _apply_verification(
+        self,
+        extracted: Dict[str, Any],
+        verification: Dict[str, Any],
+    ) -> None:
+
+        field_map = {
+            "mrp": [
+                "mrp",
+            ],
+
+            "net_quantity": [
+                "net_quantity",
+                "net_quantity_value",
+                "net_quantity_unit",
+            ],
+
+            "product_name": [
+                "product_name",
+            ],
+
+            "manufacturer": [
+                "manufacturer_name",
+            ],
+
+            "packer": [
+                "packer",
+            ],
+
+            "importer": [
+                "importer",
+            ],
+
+            "manufacturing_date": [
+                "manufacturing_date",
+                "manufacturing_month",
+                "manufacturing_year",
+            ],
+
+            "packing_date": [
+                "packing_date",
+            ],
+
+            "use_by": [
+                "use_by",
+                "expiry_date",
+            ],
+
+            "best_before": [
+                "best_before",
+            ],
+
+            "consumer_care": [
+                "consumer_care_phone",
+                "consumer_care_email",
+                "consumer_care_address",
+            ],
+
+            "country_of_origin": [
+                "country_of_origin",
+            ],
+
+            "unit_sale_price": [
+                "unit_sale_price",
+            ],
+
+            "barcode": [
+                "barcode",
+            ],
+
+            "fssai_license": [
+                "fssai_license",
+            ],
+
+            "manufacturing_license": [
+                "manufacturing_license",
+            ],
+        }
+
+        for verification_key, canonical_keys in field_map.items():
+
+            result = verification.get(
+                verification_key
+            )
+
+            if not isinstance(result, dict):
+                continue
+
+            decision = str(
+                result.get(
+                    "decision",
+                    "",
+                )
+            ).upper()
+
+            if decision in {
+                "REVIEW",
+                "REJECT",
+            }:
+
+                for key in canonical_keys:
+
+                    if key in extracted:
+                        extracted[key] = None
+
+    # =============================================================
+    # TEXT
     # =============================================================
 
     @staticmethod
-    def _clean_text(text: str) -> str:
+    def _clean_text(
+        text: str,
+    ) -> str:
+
         text = str(text or "")
-        text = text.replace("\r", " ")
-        text = text.replace("\n", " ")
-        return re.sub(r"\s+", " ", text).strip()
+
+        text = text.replace(
+            "\r",
+            " ",
+        )
+
+        text = text.replace(
+            "\n",
+            " ",
+        )
+
+        return re.sub(
+            r"\s+",
+            " ",
+            text,
+        ).strip()
 
     @staticmethod
-    def _item_text(item: OcrTextItem) -> str:
+    def _item_text(
+        item: OcrTextItem,
+    ) -> str:
+
         return FieldExtractorService._clean_text(
-            item.text
-        )
-
-    @staticmethod
-    def _bbox_bounds(
-        bbox: Any,
-    ) -> Optional[Tuple[float, float, float, float]]:
-        """
-        Return min_x, min_y, max_x, max_y.
-        Supports polygon or [x1,y1,x2,y2]-style boxes.
-        """
-        if not bbox:
-            return None
-
-        points = []
-
-        try:
-            for point in bbox:
-                if (
-                    isinstance(point, (list, tuple))
-                    and len(point) >= 2
-                ):
-                    points.append(
-                        (
-                            float(point[0]),
-                            float(point[1]),
-                        )
-                    )
-                elif isinstance(point, (int, float)):
-                    continue
-        except Exception:
-            return None
-
-        if not points:
-            return None
-
-        xs = [p[0] for p in points]
-        ys = [p[1] for p in points]
-
-        return (
-            min(xs),
-            min(ys),
-            max(xs),
-            max(ys),
-        )
-
-    @classmethod
-    def _bbox_geometry(
-        cls,
-        bbox: Any,
-    ) -> Tuple[float, float, float, float, float]:
-        bounds = cls._bbox_bounds(bbox)
-
-        if not bounds:
-            return (
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
+            getattr(
+                item,
+                "text",
+                "",
             )
-
-        min_x, min_y, max_x, max_y = bounds
-
-        width = max_x - min_x
-        height = max_y - min_y
-
-        center_x = (min_x + max_x) / 2
-        center_y = (min_y + max_y) / 2
-
-        return (
-            width,
-            height,
-            center_x,
-            center_y,
-            min_y,
-        )
-
-    @staticmethod
-    def _normalize_unit(unit: str) -> str:
-        key = unit.lower().strip()
-
-        return FieldExtractorService().unit_normalization.get(
-            key,
-            key,
         )
 
     # =============================================================
@@ -624,227 +814,454 @@ class FieldExtractorService:
         items: List[OcrTextItem],
     ) -> Optional[Dict[str, Any]]:
 
-        patterns = [
-            r"\bmrp\b\s*(?:rs\.?|₹|inr)?\s*[:.\-]?\s*"
-            r"(\d+(?:[.,]\d{1,2})?)",
+        label_pattern = re.compile(
+            r"\b(?:m\.?\s*r\.?\s*p\.?|"
+            r"maximum\s+retail\s+price|"
+            r"max\.?\s+retail\s+price)\b",
+            re.IGNORECASE,
+        )
 
-            r"\bmaximum\s+retail\s+price\b\s*"
-            r"(?:rs\.?|₹|inr)?\s*[:.\-]?\s*"
-            r"(\d+(?:[.,]\d{1,2})?)",
+        money_pattern = re.compile(
+            r"(?:rs\.?|inr)?\s*"
+            r"(\d+(?:[.,]\d{1,2})?)"
+            r"\s*(?:/-)?",
+            re.IGNORECASE,
+        )
 
-            r"\bmax\.?\s+retail\s+price\b\s*"
-            r"(?:rs\.?|₹|inr)?\s*[:.\-]?\s*"
-            r"(\d+(?:[.,]\d{1,2})?)",
-        ]
+        def get_box(item):
+            try:
+                box = getattr(item, "bounding_box", None)
+
+                if box is None:
+                    box = getattr(item, "bbox", None)
+
+                if isinstance(box, str):
+                    import json
+                    box = json.loads(box)
+
+                if not box or len(box) < 4:
+                    return None
+
+                xs = [float(p[0]) for p in box]
+                ys = [float(p[1]) for p in box]
+
+                return {
+                    "left": min(xs),
+                    "right": max(xs),
+                    "top": min(ys),
+                    "bottom": max(ys),
+                    "cx": sum(xs) / len(xs),
+                    "cy": sum(ys) / len(ys),
+                }
+
+            except Exception:
+                return None
+
+        def distance(a, b):
+            dx = 0.0
+            dy = 0.0
+
+            if a["right"] < b["left"]:
+                dx = b["left"] - a["right"]
+            elif b["right"] < a["left"]:
+                dx = a["left"] - b["right"]
+
+            if a["bottom"] < b["top"]:
+                dy = b["top"] - a["bottom"]
+            elif b["bottom"] < a["top"]:
+                dy = a["top"] - b["bottom"]
+
+            return (dx * dx + dy * dy) ** 0.5
+
+        # ---------------------------------------------------------
+        # 1. Same-line / same-box MRP declarations
+        # ---------------------------------------------------------
 
         for item in items:
-            text = self._item_text(item)
+            text_value = self._item_text(item)
 
-            for pattern in patterns:
-                match = re.search(
-                    pattern,
-                    text,
-                    re.IGNORECASE,
-                )
+            if not text_value or not label_pattern.search(text_value):
+                continue
 
-                if match:
-                    return {
-                        "value": float(
-                            match.group(1).replace(",", "")
-                        ),
-                        "currency": "INR",
-                        "confidence": float(
-                            item.confidence or 0.9
-                        ),
-                        "raw_text": text,
-                        "bbox": item.bbox,
-                    }
+            match = money_pattern.search(
+                text_value[label_pattern.search(text_value).end():]
+            )
 
-        # Split declaration:
-        # MRP Rs.
-        # 25.00
-        for index, item in enumerate(items):
-            text = self._item_text(item)
+            if not match:
+                continue
 
-            if not re.search(
-                r"\bmrp\b|maximum\s+retail\s+price",
-                text,
+            value = float(
+                match.group(1).replace(",", "")
+            )
+
+            # Reject clearly impossible prices.
+            if value <= 0 or value > 100000:
+                continue
+
+            return {
+                "value": value,
+                "currency": "INR",
+                "display": f"?{value:g}",
+                "confidence": min(
+                    0.99,
+                    float(
+                        getattr(item, "confidence", None)
+                        or 0.9
+                    ),
+                ),
+                "raw_text": text_value,
+                "bbox": getattr(item, "bbox", None),
+                "labelled": True,
+            }
+
+        # ---------------------------------------------------------
+        # 2. Separate OCR boxes: MRP label + nearby price
+        # ---------------------------------------------------------
+
+        labels = []
+
+        for item in items:
+            text_value = self._item_text(item)
+
+            if not text_value:
+                continue
+
+            if label_pattern.search(text_value):
+                box = get_box(item)
+
+                if box:
+                    labels.append(
+                        {
+                            "item": item,
+                            "text": text_value,
+                            "box": box,
+                        }
+                    )
+
+        if not labels:
+            return None
+
+        price_candidates = []
+
+        for item in items:
+            text_value = self._item_text(item)
+
+            if not text_value:
+                continue
+
+            # Price candidates should be mostly numeric/currency.
+            if not re.fullmatch(
+                r"(?:rs\.?|inr)?\s*"
+                r"\d+(?:[.,]\d{1,2})?"
+                r"\s*(?:/-)?",
+                text_value,
                 re.IGNORECASE,
             ):
                 continue
 
-            for candidate in items[
-                index + 1:index + 4
-            ]:
-                candidate_text = self._item_text(
-                    candidate
+            match = money_pattern.fullmatch(text_value.strip())
+
+            if not match:
+                continue
+
+            value = float(
+                match.group(1).replace(",", "")
+            )
+
+            if value <= 0 or value > 100000:
+                continue
+
+            box = get_box(item)
+
+            if box:
+                price_candidates.append(
+                    {
+                        "item": item,
+                        "text": text_value,
+                        "value": value,
+                        "box": box,
+                    }
                 )
 
-                match = re.search(
-                    r"^(?:₹|rs\.?|inr)?\s*"
-                    r"(\d+(?:[.,]\d{1,2})?)$",
-                    candidate_text,
-                    re.IGNORECASE,
+        best = None
+
+        for label in labels:
+            for candidate in price_candidates:
+                d = distance(label["box"], candidate["box"])
+
+                # MRP label and value should normally be physically close.
+                if d > 500:
+                    continue
+
+                score = 1000 - d
+
+                # Same horizontal row gets a bonus.
+                label_box = label["box"]
+                price_box = candidate["box"]
+
+                vertical_delta = abs(
+                    label_box["cy"] - price_box["cy"]
                 )
 
-                if match:
-                    return {
-                        "value": float(
-                            match.group(1).replace(",", "")
-                        ),
-                        "currency": "INR",
-                        "confidence": float(
-                            candidate.confidence or 0.85
-                        ),
-                        "raw_text": (
-                            f"{text} {candidate_text}"
-                        ),
-                        "bbox": candidate.bbox,
+                if vertical_delta <= 100:
+                    score += 200
+
+                # Prefer values that look like normal retail prices.
+                if candidate["value"] <= 10000:
+                    score += 20
+
+                if best is None or score > best["score"]:
+                    best = {
+                        "score": score,
+                        "candidate": candidate,
+                        "label": label,
                     }
 
-        return None
+        if best is None:
+            return None
 
+        candidate = best["candidate"]
+
+        confidence = float(
+            getattr(
+                candidate["item"],
+                "confidence",
+                None,
+            )
+            or 0.85
+        )
+
+        return {
+            "value": candidate["value"],
+            "currency": "INR",
+            "display": f"?{candidate['value']:g}",
+            "confidence": min(0.98, confidence),
+            "raw_text": (
+                f"{best['label']['text']} "
+                f"{candidate['text']}"
+            ),
+            "bbox": getattr(
+                candidate["item"],
+                "bbox",
+                None,
+            ),
+            "labelled": True,
+        }
     # =============================================================
-    # Quantity
+    # NET QUANTITY
     # =============================================================
 
     def _extract_net_quantity(
         self,
-        items: List[OcrTextItem],
+        ocr_items: List[OcrTextItem],
     ) -> Optional[Dict[str, Any]]:
+        """
+        Extract net quantity for weight, volume and count-based packages.
 
-        unit_pattern = (
-            r"g|gm|gms|gram|grams|"
-            r"kg|kgs|kilogram|kilograms|"
-            r"mg|milligram|milligrams|"
-            r"ml|milliliter|milliliters|"
-            r"millilitre|millilitres|"
-            r"l|lt|ltr|liter|litre|liters|litres"
-        )
+        Examples:
+            80 g
+            1 kg
+            500 ml
+            10 condoms
+            10 pcs
+            12 tablets
+            6 units
+        """
 
-        label_pattern = (
-            r"net\s*(?:qty|quantity|wt|weight)"
-            r"|net\s*weight"
-            r"|qty"
-            r"|quantity"
-        )
-
-        full_pattern = re.compile(
-            rf"\b(?:{label_pattern})\b"
-            rf"\s*[:.\-]?\s*"
-            rf"([\d,.]+)\s*"
-            rf"({unit_pattern})\b",
+        quantity_pattern = re.compile(
+            r"(?<!\d)(\d+(?:[.,]\d+)?)\s*"
+            r"(kg|kgs|g|gm|gms|mg|ml|l|ltr|litre|litres|cl|"
+            r"pcs?|pieces?|units?|items?|counts?|"
+            r"condoms?|tablets?|capsules?|bottles?|packs?|"
+            r"boxes?|sachets?|pouches?|strips?|rolls?)\b",
             re.IGNORECASE,
         )
 
-        # Same OCR detection
-        for item in items:
-            text = self._item_text(item)
+        label_pattern = re.compile(
+            r"\bnet\s*(?:wt\.?|weight|qty\.?|quantity)\b",
+            re.IGNORECASE,
+        )
 
-            match = full_pattern.search(text)
+        def get_box(item):
+            try:
+                box = getattr(item, "bounding_box", None)
 
-            if match:
-                value = float(
-                    match.group(1).replace(",", "")
-                )
+                if box is None:
+                    box = getattr(item, "bbox", None)
 
-                unit = self.unit_normalization.get(
-                    match.group(2).lower(),
-                    match.group(2).lower(),
-                )
+                if isinstance(box, str):
+                    import json
+                    box = json.loads(box)
+
+                if not box or len(box) < 4:
+                    return None
+
+                xs = [float(p[0]) for p in box]
+                ys = [float(p[1]) for p in box]
 
                 return {
-                    "value": value,
-                    "unit": unit,
-                    "display": f"{value:g} {unit}",
-                    "confidence": float(
-                        item.confidence or 0.9
-                    ),
-                    "raw_text": text,
-                    "bbox": item.bbox,
+                    "left": min(xs),
+                    "right": max(xs),
+                    "top": min(ys),
+                    "bottom": max(ys),
+                    "cx": sum(xs) / len(xs),
+                    "cy": sum(ys) / len(ys),
                 }
 
-        # Split OCR detections
-        quantity_labels = re.compile(
-            r"\b(?:net\s*(?:qty|quantity|wt|weight)|"
-            r"net\s*weight)\b",
-            re.IGNORECASE,
-        )
+            except Exception:
+                return None
 
-        unit_value_pattern = re.compile(
-            rf"([\d,.]+)\s*({unit_pattern})\b",
-            re.IGNORECASE,
-        )
+        def distance(a, b):
+            dx = 0.0
+            dy = 0.0
 
-        for index, item in enumerate(items):
-            text = self._item_text(item)
+            if a["right"] < b["left"]:
+                dx = b["left"] - a["right"]
+            elif b["right"] < a["left"]:
+                dx = a["left"] - b["right"]
 
-            if not quantity_labels.search(text):
+            if a["bottom"] < b["top"]:
+                dy = b["top"] - a["bottom"]
+            elif b["bottom"] < a["top"]:
+                dy = a["top"] - b["bottom"]
+
+            return (dx * dx + dy * dy) ** 0.5
+
+        unit_map = {
+            "kgs": "kg",
+            "gm": "g",
+            "gms": "g",
+            "ltr": "l",
+            "litre": "l",
+            "litres": "l",
+            "pcs": "pcs",
+            "pc": "pc",
+            "pieces": "pieces",
+            "piece": "piece",
+            "units": "units",
+            "unit": "unit",
+            "items": "items",
+            "item": "item",
+            "counts": "count",
+            "count": "count",
+        }
+
+        quantities = []
+
+        for item in ocr_items:
+            text_value = self._item_text(item)
+
+            if not text_value:
                 continue
 
-            # Look forward and backward because OCR ordering
-            # isn't guaranteed.
-            candidate_indices = []
+            match = quantity_pattern.search(text_value)
 
-            for distance in range(1, 5):
-                prev = index - distance
-                nxt = index + distance
+            if not match:
+                continue
 
-                if prev >= 0:
-                    candidate_indices.append(prev)
+            value = match.group(1).replace(",", ".")
+            raw_unit = match.group(2).lower()
+            unit = unit_map.get(raw_unit, raw_unit)
 
-                if nxt < len(items):
-                    candidate_indices.append(nxt)
-
-            for candidate_index in candidate_indices:
-                candidate = items[candidate_index]
-                candidate_text = self._item_text(candidate)
-
-                match = unit_value_pattern.search(
-                    candidate_text
-                )
-
-                if not match:
-                    continue
-
-                # Don't steal dates or declaration codes.
-                if re.search(
-                    r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}",
-                    candidate_text,
-                ):
-                    continue
-
-                value = float(
-                    match.group(1).replace(",", "")
-                )
-
-                unit = self.unit_normalization.get(
-                    match.group(2).lower(),
-                    match.group(2).lower(),
-                )
-
-                return {
+            quantities.append(
+                {
                     "value": value,
                     "unit": unit,
-                    "display": f"{value:g} {unit}",
-                    "confidence": float(
-                        min(
-                            float(item.confidence or 0.85),
-                            float(
-                                candidate.confidence or 0.85
-                            ),
-                        )
-                    ),
-                    "raw_text": (
-                        f"{text} {candidate_text}"
-                    ),
-                    "bbox": candidate.bbox,
+                    "display": f"{value} {unit}",
+                    "text": text_value,
+                    "box": get_box(item),
+                    "distance": None,
+                    "score": 0.0,
+                    "item": item,
                 }
+            )
 
-        return None
+        if not quantities:
+            return None
+
+        labels = []
+
+        for item in ocr_items:
+            text_value = self._item_text(item)
+
+            if not text_value:
+                continue
+
+            if label_pattern.search(text_value):
+                box = get_box(item)
+
+                if box:
+                    labels.append(box)
+
+        for candidate in quantities:
+
+            if candidate["box"] is not None and labels:
+                candidate["distance"] = min(
+                    distance(candidate["box"], label_box)
+                    for label_box in labels
+                )
+
+                d = candidate["distance"]
+
+                if d <= 150:
+                    candidate["score"] = 100.0
+                elif d <= 300:
+                    candidate["score"] = 80.0
+                elif d <= 600:
+                    candidate["score"] = 40.0
+                else:
+                    candidate["score"] = 5.0
+
+            else:
+                candidate["score"] = 1.0
+
+            # Clean standalone quantity.
+            if re.fullmatch(
+                r"\d+(?:[.,]\d+)?\s*"
+                r"(?:kg|kgs|g|gm|gms|mg|ml|l|ltr|litre|litres|cl|"
+                r"pcs?|pieces?|units?|items?|counts?|"
+                r"condoms?|tablets?|capsules?|bottles?|packs?|"
+                r"boxes?|sachets?|pouches?|strips?|rolls?)",
+                candidate["text"],
+                re.IGNORECASE,
+            ):
+                candidate["score"] += 10.0
+
+        labelled = [
+            candidate
+            for candidate in quantities
+            if candidate["distance"] is not None
+            and candidate["distance"] <= 300
+        ]
+
+        if labelled:
+            labelled.sort(
+                key=lambda candidate: (
+                    candidate["score"],
+                    -candidate["distance"],
+                ),
+                reverse=True,
+            )
+            best = labelled[0]
+        else:
+            quantities.sort(
+                key=lambda candidate: candidate["score"],
+                reverse=True,
+            )
+            best = quantities[0]
+
+        # Preserve the actual label text for verifier context.
+        return {
+            "value": float(best["value"]),
+            "unit": best["unit"],
+            "display": best["display"],
+            "confidence": 0.95,
+            "raw_text": best["text"],
+            "bbox": getattr(best["item"], "bbox", None),
+        }
 
     # =============================================================
-    # Manufacturer / Packer / Importer
+    # PARTY
     # =============================================================
 
     def _extract_labeled_party(
@@ -853,53 +1270,84 @@ class FieldExtractorService:
         labels: List[str],
     ) -> Optional[Dict[str, Any]]:
 
-        # Longest labels first
-        labels_sorted = sorted(
-            labels,
-            key=len,
-            reverse=True,
-        )
-
         for index, item in enumerate(items):
+
             text = self._item_text(item)
 
-            for label in labels_sorted:
+            for label in labels:
 
-                same_line = re.search(
+                pattern = (
                     rf"\b{re.escape(label)}\b"
-                    rf"\s*[:#\-]?\s*(.+)$",
+                    r"\s*[:\-]?\s*(.+)"
+                )
+
+                match = re.search(
+                    pattern,
                     text,
                     re.IGNORECASE,
                 )
 
-                if same_line:
+                if match:
+
                     candidate = (
                         self._clean_party_name(
-                            same_line.group(1)
+                            match.group(1)
                         )
                     )
 
-                    if self._valid_party_name(candidate):
+                    # Do not mistake licence numbers or licence
+                    # declarations for the manufacturer/packer name.
+                    if re.search(
+                        r"\b(?:lic|licence|license|no\.?|number)\b",
+                        candidate,
+                        re.IGNORECASE,
+                    ):
+                        continue
+
+                    if re.search(
+                        r"\b(?:mfg|mfd|manufactur(?:er|ed)?)\b",
+                        candidate,
+                        re.IGNORECASE,
+                    ) and re.search(
+                        r"\b(?:lic|licence|license)\b",
+                        candidate,
+                        re.IGNORECASE,
+                    ):
+                        continue
+
+                    if self._valid_party_name(
+                        candidate
+                    ):
+
                         return {
                             "name": candidate,
                             "confidence": float(
-                                item.confidence or 0.85
+                                getattr(
+                                    item,
+                                    "confidence",
+                                    None,
+                                )
+                                or 0.85
                             ),
                             "raw_text": text,
-                            "bbox": item.bbox,
+                            "bbox": getattr(
+                                item,
+                                "bbox",
+                                None,
+                            ),
                         }
 
-                label_only = re.fullmatch(
-                    rf"\s*{re.escape(label)}"
-                    rf"[\s:#.\-]*",
+                if re.fullmatch(
+                    rf"{re.escape(label)}"
+                    r"[\s:.#\-]*",
                     text,
                     re.IGNORECASE,
-                )
+                ):
 
-                if label_only:
                     for next_item in items[
                         index + 1:index + 4
                     ]:
+
                         candidate = (
                             self._clean_party_name(
                                 self._item_text(
@@ -911,10 +1359,15 @@ class FieldExtractorService:
                         if self._valid_party_name(
                             candidate
                         ):
+
                             return {
                                 "name": candidate,
                                 "confidence": float(
-                                    next_item.confidence
+                                    getattr(
+                                        next_item,
+                                        "confidence",
+                                        None,
+                                    )
                                     or 0.8
                                 ),
                                 "raw_text": (
@@ -922,7 +1375,11 @@ class FieldExtractorService:
                                         next_item
                                     )
                                 ),
-                                "bbox": next_item.bbox,
+                                "bbox": getattr(
+                                    next_item,
+                                    "bbox",
+                                    None,
+                                ),
                             }
 
         return None
@@ -934,19 +1391,19 @@ class FieldExtractorService:
 
         value = re.sub(
             r"\b(?:country\s+of\s+origin|"
-            r"batch\s+number|use\s+by\s+date|"
-            r"best\s+before|mrp|"
-            r"incl\.?\s+of\s+all\s+taxes|"
-            r"net\s*(?:wt|weight|qty|quantity)|"
-            r"fssai|lic\s*no\.?)\b.*$",
+            r"batch\s+number|"
+            r"use\s+by\s+date|"
+            r"best\s+before|"
+            r"mrp|"
+            r"incl\.?\s+of\s+all\s+taxes)\b.*$",
             "",
             value,
             flags=re.IGNORECASE,
         )
 
         value = re.sub(
-            r"\b(?:license|licence|lic)\s*"
-            r"(?:no\.?|number)?\s*[:\-]?\s*"
+            r"\b(?:license|licence)\s*"
+            r"(?:no\.?|number)?\s*[:\-]?"
             r"[A-Z0-9\-./]+",
             "",
             value,
@@ -964,31 +1421,37 @@ class FieldExtractorService:
         value: str,
     ) -> bool:
 
-        if not value:
-            return False
-
-        if len(value) < 2 or len(value) > 120:
+        if not value or len(value) < 2:
             return False
 
         lower = value.lower()
 
-        bad_terms = [
+        blocked_terms = [
             "country of origin",
             "batch number",
             "use by date",
             "best before",
             "mrp",
             "incl. of all taxes",
-            "net wt",
-            "net weight",
-            "fssai",
-            "customer care",
             "consumer care",
+            "customer care",
+            "marketed by",
+            "sold by",
+            "distributed by",
+            "brand owner",
+            "proprietary",
+            "net quantity",
+            "ingredients",
+            "nutrition",
+            "calories",
+            "carbohydrate",
+            "protein",
+            "fat",
         ]
 
         if any(
             term in lower
-            for term in bad_terms
+            for term in blocked_terms
         ):
             return False
 
@@ -998,123 +1461,13 @@ class FieldExtractorService:
         ):
             return False
 
+        if "@" in value:
+            return False
+
         return True
 
-    def _extract_party_address(
-        self,
-        items: List[OcrTextItem],
-        manufacturer: Optional[Dict[str, Any]],
-        packer: Optional[Dict[str, Any]],
-    ) -> Optional[Dict[str, Any]]:
-
-        target = packer or manufacturer
-
-        if not target:
-            return None
-
-        target_bbox = target.get("bbox")
-
-        target_bounds = self._bbox_bounds(
-            target_bbox
-        )
-
-        if not target_bounds:
-            return None
-
-        target_center_y = (
-            target_bounds[1] +
-            target_bounds[3]
-        ) / 2
-
-        # Locate target OCR item
-        target_index = None
-
-        for index, item in enumerate(items):
-            if item.bbox == target_bbox:
-                target_index = index
-                break
-
-        if target_index is None:
-            return None
-
-        address_parts = []
-
-        # Look at following lines.
-        for item in items[
-            target_index + 1:
-            target_index + 5
-        ]:
-            text = self._item_text(item)
-
-            if not text:
-                continue
-
-            lower = text.lower()
-
-            if any(
-                keyword in lower
-                for keyword in [
-                    "email:",
-                    "email ",
-                    "customer care",
-                    "consumer care",
-                    "phone",
-                    "contact",
-                    "mrp",
-                    "fssai",
-                    "lic no",
-                ]
-            ):
-                break
-
-            # Address-looking line
-            address_signal = (
-                re.search(
-                    r"\b(?:road|rd|street|st|"
-                    r"estate|industrial|ind\.|"
-                    r"nagar|mumbai|bangalore|"
-                    r"bengaluru|delhi|maharashtra|"
-                    r"karnataka|pin|pincode)\b",
-                    lower,
-                    re.IGNORECASE,
-                )
-                or re.search(
-                    r"\d",
-                    text,
-                )
-            )
-
-            if address_signal:
-                address_parts.append(text)
-
-        if not address_parts:
-            return None
-
-        return {
-            "value": ", ".join(address_parts),
-            "confidence": round(
-                sum(
-                    float(
-                        item.confidence or 0.8
-                    )
-                    for item in items[
-                        target_index + 1:
-                        target_index + 1 + len(
-                            address_parts
-                        )
-                    ]
-                )
-                / len(address_parts),
-                2,
-            ),
-            "raw_text": " ".join(address_parts),
-            "bbox": items[
-                target_index + 1
-            ].bbox,
-        }
-
     # =============================================================
-    # Dates
+    # DATES
     # =============================================================
 
     def _extract_date_field(
@@ -1124,17 +1477,41 @@ class FieldExtractorService:
         exclude_labels: Optional[List[str]] = None,
     ) -> Optional[Dict[str, Any]]:
 
-        exclude_labels = [
+        exclude_labels = exclude_labels or []
+
+        blocked_labels = [
             label.lower()
-            for label in (exclude_labels or [])
+            for label in exclude_labels
+        ]
+
+        blocked_labels += [
+            "date of manufacture",
+            "manufacturing date",
+            "date of mfg",
+            "mfg date",
+            "date of packing",
+            "packing date",
+            "batch number",
+            "mrp",
+            "net qty",
+            "net quantity",
+            "use by",
+            "best before",
+            "expiry",
+            "country of origin",
+            "manufacturer",
+            "packer",
+            "importer",
         ]
 
         for index, item in enumerate(items):
+
             text = self._item_text(item)
 
             matched_label = None
 
             for label in labels:
+
                 if label.lower() in text.lower():
                     matched_label = label
                     break
@@ -1142,98 +1519,77 @@ class FieldExtractorService:
             if not matched_label:
                 continue
 
-            # Same line
-            match = re.search(
+            after_label = re.sub(
+                rf"^.*?\b"
                 rf"{re.escape(matched_label)}"
-                rf"\s*[:.\-]?\s*(.*)",
+                rf"\b",
+                "",
                 text,
-                re.IGNORECASE,
+                count=1,
+                flags=re.IGNORECASE,
             )
 
-            if match:
-                date_match = re.search(
-                    r"\b\d{1,2}[/-]"
-                    r"\d{1,2}[/-]"
-                    r"\d{2,4}\b",
-                    match.group(1),
-                )
+            date_match = re.search(
+                r"\b\d{1,2}[/-]"
+                r"\d{1,2}[/-]"
+                r"\d{2,4}\b",
+                after_label,
+            )
 
-                if date_match:
-                    parsed = self._parse_date_from_text(
+            if date_match:
+
+                parsed = (
+                    self._parse_date_from_text(
                         date_match.group(0)
                     )
-
-                    if parsed:
-                        parsed.update(
-                            {
-                                "confidence": float(
-                                    item.confidence or 0.85
-                                ),
-                                "raw_text": text,
-                                "bbox": item.bbox,
-                            }
-                        )
-                        return parsed
-
-            # Nearby candidates
-            nearby = []
-
-            for distance in range(1, 5):
-                previous = index - distance
-                following = index + distance
-
-                if previous >= 0:
-                    nearby.append(
-                        (distance, previous)
-                    )
-
-                if following < len(items):
-                    nearby.append(
-                        (distance, following)
-                    )
-
-            nearby.sort(
-                key=lambda pair: pair[0]
-            )
-
-            for _, candidate_index in nearby:
-                candidate = items[candidate_index]
-                candidate_text = self._item_text(
-                    candidate
                 )
 
-                candidate_lower = (
-                    candidate_text.lower()
+                if parsed:
+
+                    parsed.update(
+                        {
+                            "confidence": float(
+                                getattr(
+                                    item,
+                                    "confidence",
+                                    None,
+                                )
+                                or 0.85
+                            ),
+                            "raw_text": text,
+                            "bbox": getattr(
+                                item,
+                                "bbox",
+                                None,
+                            ),
+                        }
+                    )
+
+                    return parsed
+
+            for distance in range(1, 4):
+
+                candidate_index = (
+                    index + distance
                 )
 
-                # Candidate is another declaration label
+                if candidate_index >= len(items):
+                    break
+
+                candidate = items[
+                    candidate_index
+                ]
+
+                candidate_text = (
+                    self._item_text(candidate)
+                )
+
+                if not candidate_text:
+                    continue
+
                 if any(
-                    blocked in candidate_lower
-                    for blocked in (
-                        exclude_labels
-                        + [
-                            "date of manufacture",
-                            "manufacturing date",
-                            "date of mfg",
-                            "mfg date",
-                            "date of packing",
-                            "packing date",
-                            "batch number",
-                            "mrp",
-                            "net qty",
-                            "net quantity",
-                            "net wt",
-                            "net weight",
-                            "use by",
-                            "best before",
-                            "expiry",
-                            "country of origin",
-                            "manufacturer",
-                            "packed by",
-                            "packer",
-                            "importer",
-                        ]
-                    )
+                    blocked in candidate_text.lower()
+                    for blocked in blocked_labels
                 ):
                     continue
 
@@ -1247,34 +1603,48 @@ class FieldExtractorService:
                 if not date_match:
                     continue
 
-                parsed = self._parse_date_from_text(
-                    date_match.group(0)
+                parsed = (
+                    self._parse_date_from_text(
+                        date_match.group(0)
+                    )
                 )
 
-                if parsed:
-                    parsed.update(
-                        {
-                            "confidence": float(
-                                min(
-                                    float(
-                                        item.confidence
-                                        or 0.8
-                                    ),
-                                    float(
-                                        candidate.confidence
-                                        or 0.8
-                                    ),
-                                )
-                            ),
-                            "raw_text": (
-                                f"{text} "
-                                f"{candidate_text}"
-                            ),
-                            "bbox": candidate.bbox,
-                        }
-                    )
+                if not parsed:
+                    continue
 
-                    return parsed
+                parsed.update(
+                    {
+                        "confidence": min(
+                            float(
+                                getattr(
+                                    item,
+                                    "confidence",
+                                    None,
+                                )
+                                or 0.8
+                            ),
+                            float(
+                                getattr(
+                                    candidate,
+                                    "confidence",
+                                    None,
+                                )
+                                or 0.8
+                            ),
+                        ),
+                        "raw_text": (
+                            f"{text} "
+                            f"{candidate_text}"
+                        ),
+                        "bbox": getattr(
+                            candidate,
+                            "bbox",
+                            None,
+                        ),
+                    }
+                )
+
+                return parsed
 
         return None
 
@@ -1283,7 +1653,6 @@ class FieldExtractorService:
         items: List[OcrTextItem],
     ) -> Optional[Dict[str, Any]]:
 
-        # First: explicit date after best-before.
         result = self._extract_date_field(
             items,
             [
@@ -1293,8 +1662,8 @@ class FieldExtractorService:
             exclude_labels=[
                 "date of manufacture",
                 "manufacturing date",
-                "use by",
                 "use by date",
+                "use by",
                 "date of packing",
                 "packing date",
             ],
@@ -1303,36 +1672,51 @@ class FieldExtractorService:
         if result:
             return result
 
-        # Second: "BEST BEFORE : 6 MONTHS"
         for item in items:
+
             text = self._item_text(item)
 
             match = re.search(
                 r"\bbest\s+before\b"
                 r"\s*[:.\-]?\s*"
-                r"(\d+(?:\.\d+)?)\s*"
-                r"(days?|months?|years?)",
+                r"(.{0,80}?"
+                r"(?:months?|month|years?|year)"
+                r"(?:\s+from\s+manufacture|\s+from\s+mfg)?"
+                r")",
                 text,
                 re.IGNORECASE,
             )
 
             if match:
+
+                value = self._clean_text(
+                    match.group(1)
+                )
+
                 return {
-                    "date": (
-                        f"{match.group(1)} "
-                        f"{match.group(2).lower()}"
-                    ),
+                    "date": value,
+                    "value_type": "duration",
+                    "duration_text": value,
                     "confidence": float(
-                        item.confidence or 0.85
+                        getattr(
+                            item,
+                            "confidence",
+                            None,
+                        )
+                        or 0.85
                     ),
                     "raw_text": text,
-                    "bbox": item.bbox,
+                    "bbox": getattr(
+                        item,
+                        "bbox",
+                        None,
+                    ),
                 }
 
         return None
 
     # =============================================================
-    # Date parser
+    # DATE PARSER
     # =============================================================
 
     def _parse_date_from_text(
@@ -1342,31 +1726,29 @@ class FieldExtractorService:
 
         text = self._clean_text(text)
 
-        # DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY
         match = re.search(
-            r"\b(\d{1,2})"
-            r"[/. -]"
-            r"(\d{1,2})"
-            r"[/. -]"
+            r"\b(\d{1,2})[/.\-]"
+            r"(\d{1,2})[/.\-]"
             r"(\d{2,4})\b",
             text,
         )
 
         if match:
+
             day = int(match.group(1))
             month = int(match.group(2))
             year_raw = match.group(3)
 
-            if not 1 <= month <= 12:
+            if not (
+                1 <= month <= 12
+                and 1 <= day <= 31
+            ):
                 return None
 
             year = int(year_raw)
 
             if len(year_raw) == 2:
                 year += 2000
-
-            if not 1 <= day <= 31:
-                return None
 
             return {
                 "date": (
@@ -1375,14 +1757,12 @@ class FieldExtractorService:
                     f"{year:04d}"
                 ),
                 "day": day,
-                "month": self._month_to_name(
-                    month
-                ),
+                "month":
+                    self._month_to_name(month),
                 "month_number": month,
                 "year": year,
             }
 
-        # Month YYYY
         match = re.search(
             r"\b("
             r"jan(?:uary)?|"
@@ -1393,8 +1773,7 @@ class FieldExtractorService:
             r"jun(?:e)?|"
             r"jul(?:y)?|"
             r"aug(?:ust)?|"
-            r"sep(?:tember)?|"
-            r"sept(?:ember)?|"
+            r"sep(?:t(?:ember)?)?|"
             r"oct(?:ober)?|"
             r"nov(?:ember)?|"
             r"dec(?:ember)?"
@@ -1406,6 +1785,7 @@ class FieldExtractorService:
         )
 
         if match:
+
             month_name = match.group(1)
             year = int(match.group(2))
 
@@ -1423,12 +1803,13 @@ class FieldExtractorService:
                     f"{month_name.title()} "
                     f"{year}"
                 ),
-                "month": month_name.title(),
-                "month_number": month_number,
+                "month":
+                    month_name.title(),
+                "month_number":
+                    month_number,
                 "year": year,
             }
 
-        # YYYY-MM-DD
         match = re.search(
             r"\b(\d{4})-"
             r"(\d{1,2})-"
@@ -1437,6 +1818,7 @@ class FieldExtractorService:
         )
 
         if match:
+
             year = int(match.group(1))
             month = int(match.group(2))
             day = int(match.group(3))
@@ -1445,6 +1827,7 @@ class FieldExtractorService:
                 1 <= month <= 12
                 and 1 <= day <= 31
             ):
+
                 return {
                     "date": (
                         f"{year:04d}-"
@@ -1452,17 +1835,17 @@ class FieldExtractorService:
                         f"{day:02d}"
                     ),
                     "day": day,
-                    "month": self._month_to_name(
-                        month
-                    ),
+                    "month":
+                        self._month_to_name(month),
                     "month_number": month,
                     "year": year,
                 }
 
         return None
 
+
     # =============================================================
-    # Consumer care
+    # CONSUMER CARE
     # =============================================================
 
     def _extract_consumer_care(
@@ -1470,172 +1853,197 @@ class FieldExtractorService:
         items: List[OcrTextItem],
     ) -> Optional[Dict[str, Any]]:
 
-        full_text = "\n".join(
-            self._item_text(item)
-            for item in items
+        context_pattern = re.compile(
+            r"\b(?:consumer\s+care|"
+            r"customer\s+care|"
+            r"helpline|"
+            r"contact\s+us|"
+            r"toll[-\s]?free)\b",
+            re.IGNORECASE,
         )
 
-        phone = None
-        email = None
-        address = None
-        confidence_values = []
-
-        # Email
-        for item in items:
-            text = self._item_text(item)
-
-            email_match = re.search(
-                r"[A-Za-z0-9._%+\-]+@"
-                r"[A-Za-z0-9.\-]+\.[A-Za-z]{2,}",
-                text,
-            )
-
-            if email_match:
-                email = email_match.group(0)
-                confidence_values.append(
-                    float(item.confidence or 0.85)
-                )
-                break
-
-        # Phone
-        # Supports:
-        # 022 28052276
-        # 022-28052276
-        # +91 22 28052276
-        # 1800xxxxxxx
         phone_pattern = re.compile(
             r"(?<!\d)"
             r"(?:\+91[\s\-]?)?"
             r"(?:0[\s\-]?)?"
-            r"(?:[2-9]\d{1,4})"
-            r"[\s\-]?"
-            r"\d{5,8}"
+            r"[6-9]\d{9}"
             r"(?!\d)"
         )
 
-        for item in items:
+        email_pattern = re.compile(
+            r"[A-Za-z0-9._%+\-]+"
+            r"@[A-Za-z0-9.\-]+\."
+            r"[A-Za-z]{2,}"
+        )
+
+        address_pattern = re.compile(
+            r"\b(?:p\.?\s*o\.?\s*box|"
+            r"post\s+box|"
+            r"address|"
+            r"write\s+to|"
+            r"road|"
+            r"street|"
+            r"nagar|"
+            r"industrial\s+estate|"
+            r"phase|"
+            r"city|"
+            r"state|"
+            r"pincode|"
+            r"pin\s*code|"
+            r"india)\b",
+            re.IGNORECASE,
+        )
+
+        context_index = None
+        phone = None
+        email = None
+        address = None
+
+        evidence = []
+
+        for index, item in enumerate(items):
             text = self._item_text(item)
 
-            # Prioritize lines that look like contact fields.
-            if re.search(
-                r"(customer\s*care|consumer\s*care|"
-                r"phone|contact|helpline|"
-                r"tel|mobile)",
-                text,
-                re.IGNORECASE,
-            ):
-                phone_match = phone_pattern.search(
-                    text
-                )
+            if not text:
+                continue
 
-                if phone_match:
-                    raw_phone = phone_match.group(0)
-
-                    digits = re.sub(
-                        r"\D",
-                        "",
-                        raw_phone,
-                    )
-
-                    # Remove country code if present.
-                    if (
-                        digits.startswith("91")
-                        and len(digits) >= 12
-                    ):
-                        digits = digits[2:]
-
-                    if len(digits) >= 8:
-                        phone = digits
-                        confidence_values.append(
-                            float(
-                                item.confidence
-                                or 0.85
-                            )
-                        )
-                        break
-
-        # Fallback: search all OCR lines.
-        if not phone:
-            for item in items:
-                text = self._item_text(item)
-
-                phone_match = phone_pattern.search(
-                    text
-                )
-
-                if phone_match:
-                    digits = re.sub(
-                        r"\D",
-                        "",
-                        phone_match.group(0),
-                    )
-
-                    if (
-                        digits.startswith("91")
-                        and len(digits) >= 12
-                    ):
-                        digits = digits[2:]
-
-                    if len(digits) >= 8:
-                        phone = digits
-                        confidence_values.append(
-                            float(
-                                item.confidence
-                                or 0.8
-                            )
-                        )
-                        break
-
-        # Consumer-care address
-        for item in items:
-            text = self._item_text(item)
-
-            address_match = re.search(
-                r"(?:write\s+to|contact|"
-                r"address)\s*[:\-]\s*(.+)",
-                text,
-                re.IGNORECASE,
-            )
-
-            if address_match:
-                address = (
-                    address_match.group(1)
-                    .strip()
-                )
-
-                confidence_values.append(
-                    float(item.confidence or 0.8)
-                )
-
+            if context_pattern.search(text):
+                context_index = index
                 break
 
-        if (
-            not phone
-            and not email
-            and not address
-        ):
+        if context_index is None:
             return None
+
+        # Consumer-care declarations are commonly split across
+        # multiple OCR lines, so inspect a bounded window.
+        window_end = min(
+            len(items),
+            context_index + 10,
+        )
+
+        phone_confidences = []
+        email_confidences = []
+        address_confidences = []
+
+        address_parts = []
+
+        for item in items[context_index:window_end]:
+            text = self._item_text(item)
+
+            if not text:
+                continue
+
+            lower = text.lower()
+
+            # Stop at another major declaration.
+            if (
+                context_index != items.index(item)
+                and re.search(
+                    r"\b(?:mrp|net\s+quantity|"
+                    r"ingredients|nutrition|"
+                    r"country\s+of\s+origin|"
+                    r"manufactured\s+by|"
+                    r"mfd\s+by)\b",
+                    lower,
+                    re.IGNORECASE,
+                )
+            ):
+                break
+
+            item_conf = float(
+                getattr(
+                    item,
+                    "confidence",
+                    None,
+                )
+                or 0.85
+            )
+
+            # Phone numbers
+            for raw_phone in phone_pattern.findall(text):
+                cleaned = re.sub(
+                    r"\D",
+                    "",
+                    raw_phone,
+                )
+
+                if (
+                    cleaned.startswith("91")
+                    and len(cleaned) == 12
+                ):
+                    cleaned = cleaned[2:]
+
+                if len(cleaned) == 10:
+                    phone = cleaned
+                    phone_confidences.append(item_conf)
+
+            # Email
+            email_match = email_pattern.search(text)
+
+            if email_match:
+                email = email_match.group(0)
+                email_confidences.append(item_conf)
+
+            # Address / postal-contact text
+            if address_pattern.search(text):
+                cleaned_address = self._clean_text(text)
+
+                if (
+                    len(cleaned_address) >= 8
+                    and cleaned_address not in address_parts
+                ):
+                    address_parts.append(
+                        cleaned_address
+                    )
+                    address_confidences.append(
+                        item_conf
+                    )
+
+            # Evidence
+            if (
+                context_pattern.search(text)
+                or phone_pattern.search(text)
+                or email_pattern.search(text)
+                or address_pattern.search(text)
+            ):
+                evidence.append({
+                    "text": text,
+                    "confidence": item_conf,
+                })
+
+        if address_parts:
+            address = " ".join(address_parts)
+
+        if not phone and not email and not address:
+            return None
+
+        confidences = (
+            phone_confidences
+            + email_confidences
+            + address_confidences
+        )
+
+        confidence = (
+            round(
+                sum(confidences) / len(confidences),
+                2,
+            )
+            if confidences
+            else 0.80
+        )
 
         return {
             "phone": phone,
             "email": email,
             "address": address,
-            "confidence": (
-                round(
-                    sum(confidence_values)
-                    / len(confidence_values),
-                    2,
-                )
-                if confidence_values
-                else 0.8
+            "confidence": confidence,
+            "raw_text": " | ".join(
+                entry["text"]
+                for entry in evidence
             ),
-            "raw_text": full_text,
+            "evidence": evidence,
+            "context_seen": True,
         }
-
-    # =============================================================
-    # Country
-    # =============================================================
-
     def _extract_country_of_origin(
         self,
         items: List[OcrTextItem],
@@ -1651,15 +2059,14 @@ class FieldExtractorService:
 
             r"origin\s*[:\-]\s*"
             r"([A-Za-z][A-Za-z\s]{1,40})",
-
-            r"product\s+of\s+"
-            r"([A-Za-z][A-Za-z\s]{1,40})",
         ]
 
         for item in items:
+
             text = self._item_text(item)
 
             for pattern in patterns:
+
                 match = re.search(
                     pattern,
                     text,
@@ -1669,18 +2076,15 @@ class FieldExtractorService:
                 if not match:
                     continue
 
-                value = match.group(1)
-
                 value = re.split(
-                    r"\b(?:batch|use by|"
-                    r"best before|mrp|"
-                    r"incl|fssai|lic)\b",
-                    value,
+                    r"\b(?:batch|"
+                    r"use\s+by|"
+                    r"best\s+before|"
+                    r"mrp|incl)\b",
+                    match.group(1),
                     maxsplit=1,
                     flags=re.IGNORECASE,
-                )[0].strip(
-                    " .,:;-"
-                )
+                )[0].strip(" .,:;-")
 
                 if not value:
                     continue
@@ -1691,16 +2095,25 @@ class FieldExtractorService:
                 return {
                     "value": value,
                     "confidence": float(
-                        item.confidence or 0.9
+                        getattr(
+                            item,
+                            "confidence",
+                            None,
+                        )
+                        or 0.9
                     ),
                     "raw_text": text,
-                    "bbox": item.bbox,
+                    "bbox": getattr(
+                        item,
+                        "bbox",
+                        None,
+                    ),
                 }
 
         return None
 
     # =============================================================
-    # Unit sale price
+    # UNIT SALE PRICE
     # =============================================================
 
     def _extract_unit_sale_price(
@@ -1712,35 +2125,51 @@ class FieldExtractorService:
             r"\b(?:unit\s+(?:sale\s+)?price|"
             r"price\s+per)\b"
             r"\s*[:.\-]?\s*"
-            r"(?:₹|rs\.?|inr)?\s*"
+            r"(?:₹|rs\.?|inr)?"
+            r"\s*"
             r"(\d+(?:[.,]\d{1,2})?)",
             re.IGNORECASE,
         )
 
         for item in items:
+
             text = self._item_text(item)
 
             match = pattern.search(text)
 
-            if match:
-                return {
-                    "value": float(
-                        match.group(1).replace(
-                            ",",
-                            "",
-                        )
-                    ),
-                    "confidence": float(
-                        item.confidence or 0.85
-                    ),
-                    "raw_text": text,
-                    "bbox": item.bbox,
-                }
+            if not match:
+                continue
+
+            value = float(
+                match.group(1).replace(
+                    ",",
+                    "",
+                )
+            )
+
+            return {
+                "value": value,
+                "currency": "INR",
+                "confidence": float(
+                    getattr(
+                        item,
+                        "confidence",
+                        None,
+                    )
+                    or 0.85
+                ),
+                "raw_text": text,
+                "bbox": getattr(
+                    item,
+                    "bbox",
+                    None,
+                ),
+            }
 
         return None
 
     # =============================================================
-    # Barcode
+    # BARCODE
     # =============================================================
 
     def _extract_barcode(
@@ -1749,55 +2178,105 @@ class FieldExtractorService:
     ) -> Optional[Dict[str, Any]]:
 
         for item in items:
+
             text = self._item_text(item)
 
-            labelled = re.search(
-                r"\b(?:barcode|ean|upc|"
-                r"isbn|gtin)\b"
+            match = re.search(
+                r"\b(?:barcode|ean|upc|isbn|gtin)\b"
                 r"\s*[:.\-]?\s*"
                 r"(\d{8,14})\b",
                 text,
                 re.IGNORECASE,
             )
 
-            if labelled:
+            if match:
+
                 return {
-                    "value": labelled.group(1),
+                    "value": match.group(1),
                     "confidence": float(
-                        item.confidence or 0.85
+                        getattr(
+                            item,
+                            "confidence",
+                            None,
+                        )
+                        or 0.85
                     ),
                     "raw_text": text,
-                    "bbox": item.bbox,
+                    "bbox": getattr(
+                        item,
+                        "bbox",
+                        None,
+                    ),
+                    "labelled": True,
                 }
 
-        # Barcode OCR commonly arrives with spaces:
-        # 8 904043 708560
         for item in items:
+
             text = self._item_text(item)
 
-            digits = re.sub(
-                r"\D",
-                "",
+            if not re.fullmatch(
+                r"\d{13}",
                 text,
-            )
-
-            if (
-                len(digits) in (8, 12, 13, 14)
-                and re.fullmatch(
-                    r"[\d\s]+",
-                    text,
-                )
             ):
-                return {
-                    "value": digits,
-                    "confidence": float(
-                        item.confidence or 0.8
-                    ),
-                    "raw_text": text,
-                    "bbox": item.bbox,
-                }
+                continue
+
+            if not self._valid_ean13(text):
+                continue
+
+            return {
+                "value": text,
+                "confidence": float(
+                    getattr(
+                        item,
+                        "confidence",
+                        None,
+                    )
+                    or 0.8
+                ),
+                "raw_text": text,
+                "bbox": getattr(
+                    item,
+                    "bbox",
+                    None,
+                ),
+                "labelled": False,
+                "checksum_valid": True,
+            }
 
         return None
+
+    @staticmethod
+    def _valid_ean13(
+        code: str,
+    ) -> bool:
+
+        if (
+            len(code) != 13
+            or not code.isdigit()
+        ):
+            return False
+
+        digits = [
+            int(d)
+            for d in code
+        ]
+
+        total = 0
+
+        for index, digit in enumerate(
+            digits[:12]
+        ):
+
+            if index % 2 == 0:
+                total += digit
+            else:
+                total += digit * 3
+
+        check = (
+            10 - total % 10
+        ) % 10
+
+        return check == digits[12]
 
     # =============================================================
     # FSSAI
@@ -1808,133 +2287,43 @@ class FieldExtractorService:
         items: List[OcrTextItem],
     ) -> Optional[Dict[str, Any]]:
 
-        # Same line
         for item in items:
+
             text = self._item_text(item)
 
             match = re.search(
-                r"\b(?:fssai|fssal)\b"
-                r"[\s:#.\-]*"
-                r"(?:lic(?:ense|ence)?|"
-                r"license|licence|no\.?)?"
-                r"[\s:#.\-]*"
+                r"\b(?:fssai\s+"
+                r"(?:license|licence|no\.?)?)"
+                r"\s*[:.\-]?\s*"
                 r"(\d{14})\b",
                 text,
                 re.IGNORECASE,
             )
 
             if match:
+
                 return {
                     "value": match.group(1),
                     "confidence": float(
-                        item.confidence or 0.9
+                        getattr(
+                            item,
+                            "confidence",
+                            None,
+                        )
+                        or 0.9
                     ),
                     "raw_text": text,
-                    "bbox": item.bbox,
-                }
-
-        # Split:
-        # FSSAI
-        # LIC No.: 12345678901234
-        for index, item in enumerate(items):
-            text = self._item_text(item)
-
-            if not re.search(
-                r"\bfssai\b|\bfssal\b",
-                text,
-                re.IGNORECASE,
-            ):
-                continue
-
-            for candidate in items[
-                index + 1:index + 4
-            ]:
-                candidate_text = self._item_text(
-                    candidate
-                )
-
-                match = re.search(
-                    r"\b(?:lic(?:ense|ence)?|"
-                    r"license|licence|no\.?)"
-                    r"[\s:#.\-]*"
-                    r"(\d{10,14})\b",
-                    candidate_text,
-                    re.IGNORECASE,
-                )
-
-                if match:
-                    number = match.group(1)
-
-                    return {
-                        "value": number,
-                        "confidence": float(
-                            min(
-                                float(
-                                    item.confidence
-                                    or 0.85
-                                ),
-                                float(
-                                    candidate.confidence
-                                    or 0.85
-                                ),
-                            )
-                        ),
-                        "raw_text": (
-                            f"{text} "
-                            f"{candidate_text}"
-                        ),
-                        "bbox": candidate.bbox,
-                    }
-
-                # Just a bare 14-digit line after FSSAI
-                if re.fullmatch(
-                    r"\d{14}",
-                    candidate_text,
-                ):
-                    return {
-                        "value": candidate_text,
-                        "confidence": float(
-                            candidate.confidence
-                            or 0.85
-                        ),
-                        "raw_text": (
-                            f"{text} "
-                            f"{candidate_text}"
-                        ),
-                        "bbox": candidate.bbox,
-                    }
-
-        # Any standalone FSSAI-looking 14-digit line
-        # near a license declaration.
-        for index, item in enumerate(items):
-            text = self._item_text(item)
-
-            if not re.search(
-                r"\blic\b|\blicense\b|\blicence\b",
-                text,
-                re.IGNORECASE,
-            ):
-                continue
-
-            match = re.search(
-                r"\b(\d{14})\b",
-                text,
-            )
-
-            if match:
-                return {
-                    "value": match.group(1),
-                    "confidence": float(
-                        item.confidence or 0.85
+                    "bbox": getattr(
+                        item,
+                        "bbox",
+                        None,
                     ),
-                    "raw_text": text,
-                    "bbox": item.bbox,
                 }
 
         return None
 
     # =============================================================
-    # Manufacturing license
+    # MANUFACTURING LICENSE
     # =============================================================
 
     def _extract_manufacturing_license(
@@ -1942,239 +2331,265 @@ class FieldExtractorService:
         items: List[OcrTextItem],
     ) -> Optional[Dict[str, Any]]:
 
-        pattern = re.compile(
-            r"\b(?:mfg\.?|manuf\.?|manufacturing)\s+"
-            r"(?:license|licence)\b"
-            r"\s*(?:no\.?|number)?\s*"
-            r"[:.\-]?\s*"
-            r"([A-Z0-9][A-Z0-9./\-]{4,})",
-            re.IGNORECASE,
-        )
+        patterns = [
+            re.compile(
+                r"\b(?:mfg\.?|manuf\.?|manufacturing)\s+"
+                r"(?:lic\.?|license|licence)\s*"
+                r"(?:no\.?|number)?\s*[:.\-]?\s*"
+                r"([A-Z0-9][A-Z0-9./\-\s]{4,})",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"\blic\.?\s*no\.?\s*[:.\-]?\s*"
+                r"([A-Z0-9][A-Z0-9./\-\s]{4,})",
+                re.IGNORECASE,
+            ),
+        ]
 
         for item in items:
             text = self._item_text(item)
 
-            match = pattern.search(text)
+            if not text:
+                continue
 
-            if match:
+            for pattern in patterns:
+                match = pattern.search(text)
+
+                if not match:
+                    continue
+
                 value = match.group(1)
+
+                value = re.split(
+                    r"\b(?:country|batch|use|best|mrp|incl)\b",
+                    value,
+                    maxsplit=1,
+                    flags=re.IGNORECASE,
+                )[0]
+
+                value = re.sub(
+                    r"\s+",
+                    " ",
+                    value,
+                ).strip(" .,:;-")
+
+                if not value:
+                    continue
+
+                if not re.search(r"\d", value):
+                    continue
 
                 return {
                     "value": value,
                     "confidence": float(
-                        item.confidence or 0.85
+                        getattr(
+                            item,
+                            "confidence",
+                            None,
+                        )
+                        or 0.85
                     ),
                     "raw_text": text,
-                    "bbox": item.bbox,
+                    "bbox": getattr(
+                        item,
+                        "bbox",
+                        None,
+                    ),
                 }
 
         return None
 
-        # =============================================================
-    # Product name
+    # =============================================================
+    # PRODUCT NAME
     # =============================================================
 
     def _extract_product_name(
         self,
         items: List[OcrTextItem],
     ) -> Optional[Dict[str, Any]]:
+        """
+        Extract the most likely product/title name.
+
+        Short title-like OCR is preferred over marketing slogans,
+        instructions, addresses, declarations and long sentences.
+        """
+
+        rejected_patterns = [
+            r"\bmrp\b",
+            r"\brs\.?\b",
+            r"\bprice\b",
+            r"\bnet\s*(?:qty|quantity|wt|weight)\b",
+            r"\bquantity\b",
+            r"\bqty\b",
+            r"\bmanufactur",
+            r"\bmfg\b",
+            r"\bmanufacturer\b",
+            r"\bpack(?:ed|ing|age|aging|size)?\b",
+            r"\bpacked\s+by\b",
+            r"\bpackaged\s+by\b",
+            r"\bpacker\b",
+            r"\bbatch\b",
+            r"\buse\s*by\b",
+            r"\bbest\s*before\b",
+            r"\bexpiry\b",
+            r"\bexpire\b",
+            r"\bincl\.?\b",
+            r"\binclusive\b",
+            r"\btaxes\b",
+            r"\bcountry\s*of\s*origin\b",
+            r"\borigin\b",
+            r"\bimporter\b",
+            r"\bimported\s+by\b",
+            r"\bconsumer\s*care\b",
+            r"\bcustomer\s*care\b",
+            r"\bhelpline\b",
+            r"\blicen[cs]e\b",
+            r"\bfssai\b",
+            r"\bdate\b",
+            r"\bnumber\b",
+            r"\bno\.?\b",
+            r"\bmarketed\s+by\b",
+            r"\bsold\s+by\b",
+            r"\bdistributed\s+by\b",
+            r"\bdistributor\b",
+            r"\bbrand\s+owner\b",
+            r"\bingredients?\b",
+            r"\bnutrition(?:al)?\b",
+            r"\benergy\b",
+            r"\bcalories?\b",
+            r"\bprotein\b",
+            r"\bcarbohydrate\b",
+            r"\bsugars?\b",
+            r"\btotal\s+fat\b",
+            r"\bsodium\b",
+            r"\bplease\b",
+            r"\bcarefully\b",
+            r"\bhereby\b",
+            r"\binstructions?\b",
+            r"\brefer\s+to\b",
+            r"\bdetails?\b",
+            r"\bmethod\b",
+            r"\bprotection\b",
+            r"\bprotected\b",
+            r"\bcontact\s+us\b",
+            r"\bwebsite\b",
+            r"\bwww\.",
+            r"\.com\b",
+            r"@",
+        ]
+
+        # Common marketing/instructional sentence signals.
+        sentence_patterns = [
+            r"\bcan be\b",
+            r"\bto\s+(?:the|a|an|use)\b",
+            r"\bfor\s+(?:single|use|details|more)\b",
+            r"\bplease\b",
+            r"\bwith\b",
+            r"\band\b",
+            r"\bcarefully\b",
+            r"\bread\b",
+            r"\bmethod of\b",
+            r"\bprotection against\b",
+            r"[.!?]$",
+        ]
+
+        # Brand/product title indicators.
+        brand_patterns = [
+            r"\bdurex\b",
+            r"\bbingo\b",
+            r"\bitc\b",
+            r"\bparle\b",
+        ]
 
         candidates = []
 
-        rejected_terms = [
-            "ingredients",
-            "net wt",
-            "net weight",
-            "net qty",
-            "net quantity",
-            "batch",
-            "pkd on",
-            "packed on",
-            "best before",
-            "use by",
-            "mrp",
-            "incl of all taxes",
-            "incl. of all taxes",
-            "fssai",
-            "lic no",
-            "license",
-            "licence",
-            "packed by",
-            "packaged by",
-            "manufactured by",
-            "manufactured and",
-            "manufactured &",
-            "customer care",
-            "consumer care",
-            "email",
-            "country of origin",
-            "product of",
-            "made in",
-        ]
+        for index, item in enumerate(items):
+            text_value = self._item_text(item).strip()
 
-        address_terms = [
-            "road",
-            "cross road",
-            "estate",
-            "ind. estate",
-            "mumbai",
-            "bengaluru",
-            "bangalore",
-            "chennai",
-            "delhi",
-            "maharashtra",
-            "karnataka",
-            "tamil nadu",
-            "gujarat",
-            "nagar",
-            "pin",
-            "pvt",
-            "private limited",
-            "ltd",
-            "plot",
-            "building",
-            "floor",
-            "industrial",
-            "sector",
-        ]
-
-        for item in items:
-            text = self._item_text(item).strip()
-
-            if len(text) < 3 or len(text) > 80:
+            if len(text_value) < 2 or len(text_value) > 60:
                 continue
 
-            lower = text.lower()
-
-            # Declaration / legal text.
-            if any(term in lower for term in rejected_terms):
-                continue
-
-            # Address-like text.
-            if any(term in lower for term in address_terms):
-                continue
-
-            # Emails / URLs.
-            if "@" in text or "www." in lower or "http" in lower:
-                continue
-
-            # Long numeric / barcode-like text.
-            digits = re.sub(r"\D", "", text)
-
-            if len(digits) >= 8:
-                continue
-
-            # License-like strings.
-            if re.search(
-                r"\blic\s*no\b|\bfssai\b",
-                lower,
+            if any(
+                re.search(pattern, text_value, re.IGNORECASE)
+                for pattern in rejected_patterns
             ):
                 continue
 
-            # Bounding box.
-            width, height, cx, cy, _ = (
-                self._bbox_geometry(item.bbox)
+            if any(
+                ord(ch) > 127
+                for ch in text_value
+            ):
+                continue
+
+            # Product titles should usually not be full sentences.
+            sentence_hits = sum(
+                bool(re.search(pattern, text_value, re.IGNORECASE))
+                for pattern in sentence_patterns
             )
 
-            # Reject vertically oriented OCR.
-            if (
-                width > 0
-                and height > 0
-                and height > width * 2.5
-            ):
+            if sentence_hits >= 2:
                 continue
 
-            # Must contain letters.
+            # Avoid long prose even when no blacklist term matched.
+            word_count = len(text_value.split())
+
+            if word_count > 8:
+                continue
+
             alpha_count = sum(
-                1
-                for char in text
-                if char.isalpha()
+                ch.isalpha()
+                for ch in text_value
             )
 
-            if alpha_count < 3:
-                continue
-
-            words = text.split()
-
-            alpha_words = [
-                word
-                for word in words
-                if re.search(
-                    r"[A-Za-z]{2,}",
-                    word,
-                )
-            ]
-
-            if not alpha_words:
-                continue
-
-            # Tiny isolated OCR fragments are unreliable.
-            if len(words) == 1 and len(text) <= 4:
+            if alpha_count < 2:
                 continue
 
             confidence = float(
-                item.confidence or 0.0
+                getattr(item, "confidence", None)
+                or 0.0
             )
 
-            score = confidence * 10
+            score = confidence * 10.0
 
-            # -----------------------------------------------------
-            # TITLE POSITION
-            # -----------------------------------------------------
-            # Earlier text is more likely to be the title.
-            if cy < 100:
-                score += 12.0
-            elif cy < 160:
+            # Strong preference for compact product-title shapes.
+            if 1 <= word_count <= 5:
                 score += 8.0
-            elif cy < 250:
-                score += 3.0
-            elif cy > 300:
-                score -= 6.0
 
-            # -----------------------------------------------------
-            # TITLE-LIKE LENGTH
-            # -----------------------------------------------------
-            if 2 <= len(words) <= 5:
+            if 2 <= word_count <= 4:
                 score += 5.0
-            elif len(words) == 1:
-                score += 1.0
-            elif len(words) > 8:
-                score -= 3.0
 
-            # -----------------------------------------------------
-            # PRODUCT-LIKE TEXT
-            # -----------------------------------------------------
-            if any(
-                char.isdigit()
-                for char in text
+            # Uppercase packaging text is often a product descriptor.
+            if text_value.upper() == text_value:
+                score += 3.0
+
+            # Title Case is also useful.
+            if all(
+                word[:1].isupper()
+                for word in text_value.split()
+                if word and word[0].isalpha()
             ):
                 score += 2.0
 
-            uppercase_chars = sum(
-                1
-                for char in text
-                if char.isupper()
+            # Strong product-brand signal.
+            brand_hits = sum(
+                bool(re.search(pattern, text_value, re.IGNORECASE))
+                for pattern in brand_patterns
             )
 
-            if uppercase_chars >= 4:
-                score += 2.0
+            score += brand_hits * 12.0
 
-            if 5 <= len(text) <= 35:
-                score += 2.0
+            # Penalize prose-like punctuation.
+            if re.search(r"[,;:!?]", text_value):
+                score -= 4.0
 
-            # Penalize punctuation-heavy text.
-            punctuation_count = sum(
-                1
-                for char in text
-                if char in ",.:;/-()"
-            )
-
-            if punctuation_count >= 4:
-                score -= 2.0
+            # Penalize very long text.
+            if len(text_value) > 45:
+                score -= 4.0
 
             candidates.append(
                 (
                     score,
+                    index,
                     item,
                 )
             )
@@ -2183,24 +2598,37 @@ class FieldExtractorService:
             return None
 
         candidates.sort(
-            key=lambda pair: pair[0],
+            key=lambda x: x[0],
             reverse=True,
         )
 
-        item = candidates[0][1]
-        text = self._item_text(item)
+        _, _, item = candidates[0]
+
+        text_value = self._item_text(item)
 
         return {
-            "value": text,
+            "value": text_value,
             "confidence": float(
-                item.confidence or 0.7
+                getattr(item, "confidence", None)
+                or 0.7
             ),
-            "raw_text": text,
-            "bbox": item.bbox,
+            "raw_text": text_value,
+            "bbox": getattr(item, "bbox", None),
         }
+
     # =============================================================
-    # Utilities
+    # UTILITIES
     # =============================================================
+
+    def _normalize_unit(
+        self,
+        unit: str,
+    ) -> str:
+
+        return self.unit_normalization.get(
+            str(unit).lower().strip(),
+            str(unit).lower().strip(),
+        )
 
     @staticmethod
     def _month_to_number(
@@ -2235,7 +2663,7 @@ class FieldExtractorService:
         }
 
         return months.get(
-            month_name.lower()
+            str(month_name).lower()
         )
 
     @staticmethod
@@ -2263,14 +2691,9 @@ class FieldExtractorService:
         )
 
 
-# =============================================================
-# Convenience wrapper
-# =============================================================
-
 async def extract_fields(
     ocr_texts: List[OcrTextItem],
 ) -> Dict[str, Any]:
-    """Convenience wrapper."""
 
     service = FieldExtractorService()
 

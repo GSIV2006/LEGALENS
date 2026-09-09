@@ -1,0 +1,153 @@
+{
+  "rule_set": {
+    "code": "LM_PCR_2011_CONSOLIDATED_2023",
+    "version": "2023-consolidated",
+    "jurisdiction": "India",
+    "title": "Legal Metrology (Packaged Commodities) Rules, 2011 \u2014 consolidated through 2023 amendments",
+    "effective_from": "2024-01-01",
+    "status": "operative_baseline",
+    "source": {
+      "title": "The Legal Metrology (Packaged Commodities) Rules, 2011 with amendments",
+      "publisher": "Department of Consumer Affairs, Ministry of Consumer Affairs, Government of India",
+      "url": "https://consumeraffairs.nic.in/sites/default/files/file-uploads/latestnews/LM_PCR_All_Amendements.pdf"
+    }
+  },
+  "fields": [
+    {
+      "code": "manufacturer_packer_importer",
+      "field": "manufacturer_name",
+      "label_patterns": [
+        "manufacturer",
+        "manufactured by",
+        "packed by",
+        "packer",
+        "importer",
+        "imported by"
+      ],
+      "requirement": "At least the applicable name/address declaration must be present.",
+      "mandatory": true,
+      "severity": "high"
+    },
+    {
+      "code": "country_of_origin",
+      "field": "country_of_origin",
+      "label_patterns": [
+        "country of origin",
+        "made in",
+        "origin"
+      ],
+      "requirement": "Required for imported packages where applicable.",
+      "mandatory": false,
+      "applies_when": "imported",
+      "severity": "medium"
+    },
+    {
+      "code": "common_generic_name",
+      "field": "product_name",
+      "label_patterns": [],
+      "requirement": "The common/generic name of the commodity must be declared.",
+      "mandatory": true,
+      "severity": "high"
+    },
+    {
+      "code": "net_quantity",
+      "field": "net_quantity",
+      "label_patterns": [
+        "net wt",
+        "net wt.",
+        "net weight",
+        "net qty",
+        "net quantity"
+      ],
+      "requirement": "Net quantity must be declared in the prescribed unit/form.",
+      "mandatory": true,
+      "severity": "high"
+    },
+    {
+      "code": "manufacture_date",
+      "field": "manufacturing_date",
+      "label_patterns": [
+        "mfg",
+        "mfd",
+        "manufactured",
+        "month and year"
+      ],
+      "requirement": "Month and year of manufacture/packing/import are required as applicable.",
+      "mandatory": true,
+      "severity": "medium"
+    },
+    {
+      "code": "best_before_use_by",
+      "field": "best_before",
+      "label_patterns": [
+        "best before",
+        "use by",
+        "expiry"
+      ],
+      "requirement": "Best-before/use-by information is required where applicable, including where the commodity may become unfit for human consumption.",
+      "mandatory": false,
+      "severity": "medium"
+    },
+    {
+      "code": "mrp",
+      "field": "mrp",
+      "label_patterns": [
+        "mrp",
+        "maximum retail price",
+        "max retail price"
+      ],
+      "requirement": "Maximum Retail Price must be declared in Indian currency and inclusive of taxes.",
+      "mandatory": true,
+      "severity": "critical"
+    },
+    {
+      "code": "unit_sale_price",
+      "field": "unit_sale_price",
+      "label_patterns": [
+        "unit sale price",
+        "price per",
+        "per g",
+        "per kg",
+        "per ml",
+        "per litre",
+        "per number"
+      ],
+      "requirement": "Unit sale price must be declared in the prescribed form, subject to applicability/exceptions.",
+      "mandatory": true,
+      "severity": "high"
+    },
+    {
+      "code": "consumer_care",
+      "field": "consumer_care",
+      "label_patterns": [
+        "consumer care",
+        "customer care",
+        "helpline",
+        "toll free",
+        "contact us"
+      ],
+      "requirement": "Consumer-care contact details must be declared.",
+      "mandatory": true,
+      "severity": "medium"
+    },
+    {
+      "code": "dimensions",
+      "field": "dimensions",
+      "label_patterns": [
+        "length",
+        "width",
+        "height",
+        "dimension"
+      ],
+      "requirement": "Dimensions are required for commodities where the rules make them applicable.",
+      "mandatory": false,
+      "severity": "low"
+    }
+  ],
+  "decision_model": {
+    "verified": "Declaration found with sufficient OCR/semantic evidence.",
+    "potential_non_compliance": "Applicable declaration is absent, malformed, or contradicted by strong evidence.",
+    "review": "Evidence is incomplete/ambiguous and requires manual verification.",
+    "measurement_note": "Image OCR verifies declared text; it does not prove the actual physical quantity without measurement."
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "system_statuses": [
+    {
+      "code": "VERIFIED",
+      "ui_label": "Verified",
+      "meaning": "Evidence supports the declaration."
+    },
+    {
+      "code": "POTENTIAL_NON_COMPLIANCE",
+      "ui_label": "Potential Non-Compliance",
+      "meaning": "Strong evidence of a missing or invalid applicable declaration."
+    },
+    {
+      "code": "REVIEW",
+      "ui_label": "Manual Review",
+      "meaning": "Evidence is insufficient or ambiguous."
+    }
+  ],
+  "ai_statement_for_demo": "LEGALENS uses AI-powered OCR and semantic field verification to determine a package's compliance status against the configured Legal Metrology ruleset."
+}
