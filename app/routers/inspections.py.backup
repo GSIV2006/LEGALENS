@@ -18,7 +18,6 @@ This is the CORE router for the SIH project.
 import os
 import json
 import shutil
-import io
 from typing import Optional, List
 from datetime import datetime
 
@@ -306,19 +305,7 @@ def get_inspection(
             }
             for img in images
         ],
-        ocr_data=[
-    {
-        "id": item.id,
-        "inspection_id": item.inspection_id,
-        "text": item.text,
-        "confidence": item.confidence,
-        "bounding_box": item.bbox,
-        "source_image": item.source_image,
-        "page_number": item.page_number,
-        "created_at": item.created_at,
-    }
-    for item in ocr_data
-],
+        ocr_data=[item.to_dict() for item in ocr_data],
         compliance_checks=[
             {
                 "id": check.id,
@@ -435,11 +422,11 @@ async def upload_inspection_images(
 
     for image_file in images:
         # Validate file
-        is_valid = storage_service.validate_file_type(image_file.content_type)
+        is_valid, error_msg = storage_service.validate_file_type(image_file.content_type)
         if not is_valid:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Unsupported image type: {image_file.content_type}. Allowed types: JPEG, PNG, WEBP.",
+                detail=error_msg,
             )
 
         # Read file content
@@ -455,7 +442,7 @@ async def upload_inspection_images(
 
         # Save file
         storage_info = await storage_service.save_image(
-            file_data=io.BytesIO(content),
+            file_data=content,
             filename=image_file.filename,
             view_type=view_type,
             inspection_id=inspection_id,

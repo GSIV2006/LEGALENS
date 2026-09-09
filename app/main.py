@@ -102,6 +102,7 @@ def configure_cors(app: FastAPI):
     allowed_origins = [
         "http://localhost:3000",
         "http://localhost:5173",
+        "http://10.189.236.68:5173",
     ]
 
     frontend_url = settings.FRONTEND_URL

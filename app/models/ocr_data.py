@@ -58,6 +58,7 @@ class OcrData(Base):
         """Convert to dictionary representation."""
         return {
             "id": self.id,
+            "inspection_id": self.inspection_id,
             "text": self.text,
             "confidence": self.confidence,
             "bounding_box": self.bbox,
