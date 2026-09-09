@@ -455,11 +455,17 @@ class VerificationService:
         )
 
         # Find nearby NETWT / NET QTY evidence.
+        
         label_pattern = re.compile(
-            r"\bnet\s*(?:wt\.?|weight|qty\.?|quantity)\b",
+            r"\bnet\s*(?:"
+            r"wt\.?|"
+            r"w\s*e\s*(?:i\s*)?g\s*h\s*t|"
+            r"w\s*e\s*i?\s*g\s*h\s*t|"
+            r"qty\.?|"
+            r"q\s*u\s*a\s*n\s*t\s*i\s*t*y"
+            r")\b",
             re.IGNORECASE,
         )
-
         evidence = []
 
         for item in context:

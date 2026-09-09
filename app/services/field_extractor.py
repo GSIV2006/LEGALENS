@@ -990,7 +990,7 @@ class FieldExtractorService:
                 d = distance(label["box"], candidate["box"])
 
                 # MRP label and value should normally be physically close.
-                if d > 500:
+                if d > 40:
                     continue
 
                 score = 1000 - d
@@ -1078,7 +1078,13 @@ class FieldExtractorService:
         )
 
         label_pattern = re.compile(
-            r"\bnet\s*(?:wt\.?|weight|qty\.?|quantity)\b",
+            r"\bnet\s*(?:"
+            r"wt\.?|"
+            r"w\s*e\s*(?:i\s*)?g\s*h\s*t|"
+            r"w\s*e\s*i?\s*g\s*h\s*t|"
+            r"qty\.?|"
+            r"q\s*u\s*a\s*n\s*t\s*i\s*t\s*y"
+            r")\b",
             re.IGNORECASE,
         )
 
@@ -1147,6 +1153,97 @@ class FieldExtractorService:
         }
 
         quantities = []
+
+        # Prefer quantities explicitly present in the same OCR box
+        # as a NET label, e.g. "NET WE GHT: 75.6g".
+        labelled_quantities = []
+
+        for item in ocr_items:
+            text_value = self._item_text(item)
+
+            if not text_value:
+                continue
+
+            if not label_pattern.search(text_value):
+                continue
+
+            match = quantity_pattern.search(text_value)
+
+            if match:
+                value = match.group(1).replace(",", ".")
+                raw_unit = match.group(2).lower()
+                unit = unit_map.get(raw_unit, raw_unit)
+
+                labelled_quantities.append(
+                    {
+                        "value": value,
+                        "unit": unit,
+                        "display": f"{value} {unit}",
+                        "text": text_value,
+                        "box": get_box(item),
+                        "distance": 0,
+                        "score": 1000.0,
+                        "item": item,
+                    }
+                )
+
+        # Fallback for OCR variants such as:
+        # "NET WE GHT: 75.6g"
+        # "NET WEIGHT: 75.6g"
+        # "NET WEGHT: 75.6g"
+        if not labelled_quantities:
+            net_fallback_pattern = re.compile(
+                r"\bnet\s+"
+                r"(?:w\s*e\s*i?\s*g\s*h\s*t|"
+                r"w\s*e\s*g\s*h\s*t|"
+                r"wt\.?)"
+                r"\s*[:\-]?\s*"
+                r"(\d+(?:[.,]\d+)?)\s*"
+                r"(kg|kgs|g|gm|gms|mg|ml|l|ltr|litre|litres|cl)\b",
+                re.IGNORECASE,
+            )
+
+            for item in ocr_items:
+                text_value = self._item_text(item)
+
+                if not text_value:
+                    continue
+
+                match = net_fallback_pattern.search(text_value)
+
+                if not match:
+                    continue
+
+                value = match.group(1).replace(",", ".")
+                raw_unit = match.group(2).lower()
+                unit = unit_map.get(raw_unit, raw_unit)
+
+                return {
+                    "value": float(value),
+                    "unit": unit,
+                    "display": f"{value} {unit}",
+                    "confidence": float(
+                        getattr(item, "confidence", None)
+                        or 0.95
+                    ),
+                    "raw_text": text_value,
+                    "bbox": getattr(item, "bbox", None),
+                }
+
+        if labelled_quantities:
+            best = labelled_quantities[0]
+
+            return {
+                "value": float(best["value"]),
+                "unit": best["unit"],
+                "display": best["display"],
+                "confidence": float(
+                    getattr(best["item"], "confidence", None)
+                    or 0.95
+                ),
+                "raw_text": best["text"],
+                "bbox": getattr(best["item"], "bbox", None),
+            }
 
         for item in ocr_items:
             text_value = self._item_text(item)
@@ -1315,6 +1412,19 @@ class FieldExtractorService:
                     ):
                         continue
 
+                    # Reject OCR fragments that are too short or look like
+                    # OCR corruption of legal/company text.
+                    if len(candidate.split()) < 2:
+                        continue
+
+                    if not re.search(
+                        r"\b(?:pvt\.?|private|ltd\.?|limited|products|foods|"
+                        r"industries|company|co\.?)\b",
+                        candidate,
+                        re.IGNORECASE,
+                    ):
+                        continue
+
                     if self._valid_party_name(
                         candidate
                     ):
@@ -1355,6 +1465,17 @@ class FieldExtractorService:
                                 )
                             )
                         )
+
+                        if len(candidate.split()) < 2:
+                            continue
+
+                        if not re.search(
+                            r"\b(?:pvt\.?|private|ltd\.?|limited|products|foods|"
+                            r"industries|company|co\.?)\b",
+                            candidate,
+                            re.IGNORECASE,
+                        ):
+                            continue
 
                         if self._valid_party_name(
                             candidate
@@ -2340,8 +2461,8 @@ class FieldExtractorService:
                 re.IGNORECASE,
             ),
             re.compile(
-                r"\blic\.?\s*no\.?\s*[:.\-]?\s*"
-                r"([A-Z0-9][A-Z0-9./\-\s]{4,})",
+                r"\blic\.?\s*(?:no\.?)?\s*[:.\-]?\s*"
+                r"([0-9][0-9A-Z./\-]{5,})",
                 re.IGNORECASE,
             ),
         ]
@@ -2438,6 +2559,13 @@ class FieldExtractorService:
             r"\btaxes\b",
             r"\bcountry\s*of\s*origin\b",
             r"\borigin\b",
+
+            # Known location/address phrases
+            r"\bvile\s+parle\b",
+            r"\bnorth\s+level\s+crossing\b",
+
+            # Address/location patterns — these should never be
+            # selected as the product name.
             r"\bimporter\b",
             r"\bimported\s+by\b",
             r"\bconsumer\s*care\b",
@@ -2498,7 +2626,19 @@ class FieldExtractorService:
             r"\bdurex\b",
             r"\bbingo\b",
             r"\bitc\b",
-            r"\bparle\b",
+        ]
+
+        # Words that strongly suggest an actual product title.
+        product_patterns = [
+            r"\bkrackjack\b",
+            r"\bbiscuit(?:s)?\b",
+            r"\bcookie(?:s)?\b",
+            r"\bchocolate\b",
+            r"\bchips?\b",
+            r"\bnoodles?\b",
+            r"\bsoap\b",
+            r"\bshampoo\b",
+            r"\btoothpaste\b",
         ]
 
         candidates = []
@@ -2578,6 +2718,28 @@ class FieldExtractorService:
 
             score += brand_hits * 12.0
 
+            # Penalize company/legal-entity names so they are not
+            # mistaken for the product name.
+            if re.search(
+                r"\b(?:pvt\.?|private)\s*(?:ltd\.?|limited)\b",
+                text_value,
+                re.IGNORECASE,
+            ):
+                score -= 40.0
+
+            # Company/legal entity names should not beat an actual
+            # product title such as "Krackjack Biscuits".
+            if re.search(
+                r"\bproducts\b",
+                text_value,
+                re.IGNORECASE,
+            ) and re.search(
+                r"\b(?:pvt\.?|ltd\.?|limited|private)\b",
+                text_value,
+                re.IGNORECASE,
+            ):
+                score -= 20.0
+
             # Penalize prose-like punctuation.
             if re.search(r"[,;:!?]", text_value):
                 score -= 4.0
@@ -2585,6 +2747,15 @@ class FieldExtractorService:
             # Penalize very long text.
             if len(text_value) > 45:
                 score -= 4.0
+
+            # Strongly prefer OCR text that looks like an actual
+            # product title rather than a manufacturer/address.
+            product_hits = sum(
+                bool(re.search(pattern, text_value, re.IGNORECASE))
+                for pattern in product_patterns
+            )
+
+            score += product_hits * 15.0
 
             candidates.append(
                 (
